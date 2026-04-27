@@ -918,7 +918,10 @@ static int __copyin(void *uaddr, void *kaddr, size_t len) {
 
 static void kern_panic(char *msg) { panic(msg); }
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 25))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+static void thread_start(struct tpriv *tpriv) {}
+static void thread_end(struct tpriv *tpriv) {}
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 25))
 static void thread_start(struct tpriv *tpriv) {
   if (current->io_context)
     put_io_context(current->io_context);
