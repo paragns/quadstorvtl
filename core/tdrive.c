@@ -1258,7 +1258,11 @@ tape_custom_size_adjust(struct tape *tape, uint64_t size)
 	uint32_t custom_size;
 	uint32_t cur_size;
 	uint32_t tape_size;
-	
+
+	/* Sub-GB tapes: GB-unit math would truncate to zero; skip adjustment */
+	if (tape->size < (1ULL << 30))
+		return size;
+
 	default_size = (uint32_t)(get_vol_size_default(tape->make) >> 30);
 	tape_size = (uint32_t)(tape->size >> 30);
 	cur_size = (uint32_t)(size >> 30);
@@ -1464,8 +1468,14 @@ tdrive_cmd_set_capacity(struct tdrive *tdrive, struct qsio_scsiio *ctio)
 		return 0;
 	}
 
-	tape_size = (uint32_t)(tape->size >> 30);
-	set_size = ((uint64_t)((tape_size * proportion) / 65535)) << 30;
+	if (tape->size < (1ULL << 30)) {
+		/* Sub-GB tape: use MB granularity to avoid zeroing set_size */
+		tape_size = (uint32_t)(tape->size >> 20);
+		set_size = ((uint64_t)((tape_size * proportion) / 65535)) << 20;
+	} else {
+		tape_size = (uint32_t)(tape->size >> 30);
+		set_size = ((uint64_t)((tape_size * proportion) / 65535)) << 30;
+	}
 	set_size = align_size(set_size, BINT_UNIT_SIZE);
 
 	if (tape->set_size == set_size)

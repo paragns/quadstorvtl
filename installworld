@@ -113,7 +113,12 @@ else
 	fi
 	chmod +x $QUADSTOR_ROOT/scripts/qlainst
 	sudo $QUADSTOR_ROOT/scripts/qlainst
-	if [ -d /etc/rc.d/init.d ]; then
+	if [ -d /run/systemd/system ]; then
+		sudo install -m 755 $QUADSTOR_ROOT/etc/quadstor.linux /etc/rc.d/init.d/quadstorvtl
+		sudo install -m 644 $QUADSTOR_ROOT/etc/quadstorvtl.service /etc/systemd/system/quadstorvtl.service
+		sudo systemctl daemon-reload
+		sudo systemctl enable quadstorvtl
+	elif [ -d /etc/rc.d/init.d ]; then
 		sudo install -m 755 $QUADSTOR_ROOT/etc/quadstor.linux /etc/rc.d/init.d/quadstorvtl
 		sudo /sbin/chkconfig --add quadstorvtl
 	elif [ -d /etc/rc.d ]; then
@@ -165,6 +170,9 @@ elif [ -f /etc/debian_version ]; then
 elif [ -f /etc/SuSE-release ]; then
 	htdocs="/srv/www/htdocs"
 	cgibin="/srv/www/cgi-bin"
+elif [ -f /etc/rocky-release ]; then
+	htdocs=/var/www/html
+	cgibin=/var/www/cgi-bin
 elif [ -f /etc/redhat-release ]; then
 	htdocs=/var/www/html
 	cgibin=/var/www/cgi-bin

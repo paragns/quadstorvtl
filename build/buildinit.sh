@@ -12,6 +12,8 @@ fi
 tarfile="vtpgsql$1.tgz"
 if [ "$1" = "" ]; then
 	tarfile="vtpgsqlrhel6.tgz"
+elif [ "$1" = "rocky8" -o "$1" = "rocky9" ]; then
+	tarfile="vtpgsqlrhel6.tgz"
 fi
 
 oldpwd=`pwd`
@@ -37,7 +39,9 @@ sed -i -e "s/^host/#host/g" $QUADSTOR_ROOT/pgsql/share/pg_hba.conf.sample
 rm -f $QUADSTOR_ROOT/pgsql/share/postgresql.conf.sample-e
 rm -f $QUADSTOR_ROOT/pgsql/share/pg_hba.conf.sample-e
 
-cd $QUADSTOR_ROOT/pgsql && gmake install
+PMAKE="make"
+which gmake > /dev/null 2>&1 && PMAKE="gmake"
+cd $QUADSTOR_ROOT/pgsql && $PMAKE install
 
 mkdir -p $QUADSTOR_INSTALL_ROOT/sbin
 mkdir -p $QUADSTOR_INSTALL_ROOT/bin
@@ -45,6 +49,8 @@ mkdir -p $QUADSTOR_INSTALL_ROOT/bin
 rm -f $QUADSTOR_ROOT/target-mode/fc/qla2xxx
 
 if [ "$1" = "rhel6" -o "$1" = "rhel6x86" ]; then
+	cd $QUADSTOR_ROOT/target-mode/fc && ln -s qla2xxx.upstream qla2xxx
+elif [ "$1" = "rocky8" -o "$1" = "rocky9" ]; then
 	cd $QUADSTOR_ROOT/target-mode/fc && ln -s qla2xxx.upstream qla2xxx
 elif [ "$1" = "sles11sp2" ]; then
 	cd $QUADSTOR_ROOT/target-mode/fc && ln -s qla2xxx.upstream qla2xxx

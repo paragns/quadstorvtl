@@ -770,7 +770,7 @@ get_config_value(char *path, char *name, char *value)
 	return 0;
 }
 
-static void 
+static void
 check_max_vcart_size(void)
 {
 	char buf[256];
@@ -778,11 +778,22 @@ check_max_vcart_size(void)
 
 	buf[0] = 0;
 	max_vcart_size = 0;
+
+	/* MaxVCartSizeMB: size in MB, supports sub-GB values (e.g. 15) */
+	get_config_value(QUADSTOR_CONFIG_FILE, "MaxVCartSizeMB", buf);
+	if (buf[0]) {
+		tmp_size = atoi(buf);
+		if (tmp_size >= 1 && tmp_size <= (1600 * 1024))
+			max_vcart_size = (uint64_t)tmp_size * 1024 * 1024;
+		return;
+	}
+
+	/* Legacy: MaxVCartSize in GB (1–1600) */
 	get_config_value(QUADSTOR_CONFIG_FILE, "MaxVCartSize", buf);
 	if (buf[0]) {
 		tmp_size = atoi(buf);
 		if (tmp_size >= 1 && tmp_size <= 1600)
-			max_vcart_size = tmp_size;
+			max_vcart_size = (uint64_t)tmp_size * 1024 * 1024 * 1024;
 	}
 }
 
@@ -1270,7 +1281,7 @@ uint64_t
 get_size_spec(int voltype)
 {
 	if (max_vcart_size)
-		return (max_vcart_size * 1024 * 1024 * 1024);
+		return max_vcart_size;  /* already in bytes */
 
 	return get_vol_size_default(voltype);
 }
