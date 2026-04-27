@@ -517,6 +517,10 @@ __zalloc(size_t size, int type, allocflags_t aflags)
 	return ret;
 }
 
+/* kernel 4.18+ defines __malloc as a GCC attribute macro; undefine before use */
+#ifdef __malloc
+#undef __malloc
+#endif
 static void*
 __malloc(size_t size, int type, allocflags_t aflags)
 {
@@ -1015,27 +1019,41 @@ g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int), void *consumer, ui
 static void
 bio_free_pages(bio_t *bio)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
+	struct bio_vec bvec;
+	struct bvec_iter j;
+	bio_for_each_segment(bvec, bio, j) {
+		put_page(bvec.bv_page);
+	}
+#else
 	struct bio_vec *bvec;
 	int j;
-
 	bio_for_each_segment(bvec, bio, j) {
 		put_page(bvec->bv_page);
 	}
+#endif
 }
 
-static void 
+static void
 bio_free_page(bio_t *bio)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
+	put_page(bio->bi_io_vec[0].bv_page);
+#else
 	struct bio_vec *bvec;
-
 	bvec = bio_iovec_idx(bio, 0);
 	put_page(bvec->bv_page);
+#endif
 }
 
 static int
 bio_get_command(bio_t *bio)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
+	if (bio_op(bio) == REQ_OP_READ)
+#else
 	if (bio->bi_rw == READ)
+#endif
 		return QS_IO_READ;
 	else
 		return QS_IO_WRITE;
@@ -1044,7 +1062,11 @@ bio_get_command(bio_t *bio)
 static int
 bio_get_length(bio_t *bio)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
+	return bio->bi_iter.bi_size;
+#else
 	return bio->bi_size;
+#endif
 }
 
 static void* 
@@ -1071,13 +1093,21 @@ bio_get_iodev(bio_t *bio)
 static uint64_t
 bio_get_start_sector(bio_t *bio)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
+	return bio->bi_iter.bi_sector;
+#else
 	return bio->bi_sector;
+#endif
 }
 
 static uint32_t
 bio_get_max_pages(iodev_t *iodev)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
+	return queue_max_segments(bdev_get_queue(iodev));
+#else
 	return bio_get_nr_vecs(iodev);
+#endif
 }
 
 static uint32_t 
@@ -1402,12 +1432,20 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd, unsigned long
 
 	if (_IOC_DIR (cmd) & _IOC_READ)
 	{
+#ifdef VERIFY_READ
 		err = !access_ok (VERIFY_READ, userp, _IOC_SIZE (cmd));
+#else
+		err = !access_ok (userp, _IOC_SIZE (cmd));
+#endif
 	}
 
 	if (_IOC_DIR (cmd) & _IOC_WRITE)
 	{
+#ifdef VERIFY_WRITE
 		err = !access_ok (VERIFY_WRITE, userp, _IOC_SIZE (cmd));
+#else
+		err = !access_ok (userp, _IOC_SIZE (cmd));
+#endif
 	}
 
 	if (err)
