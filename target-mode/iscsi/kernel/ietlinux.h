@@ -9,7 +9,7 @@
 #include <linux/hash.h>
 #include <linux/proc_fs.h>
 #include <linux/ip.h>
-#include <asm/scatterlist.h>
+#include <linux/scatterlist.h>
 #include <asm/byteorder.h>
 #include <asm/ioctls.h>
 #include <net/sock.h>

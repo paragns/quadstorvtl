@@ -19,7 +19,7 @@ CFLAGS += -DFREEBSD
 CXXFLAGS += -DFREEBSD
 endif
 
-CFLAGS += -Werror
+CFLAGS += -Werror -Wno-format-truncation -Wno-format-overflow -Wno-stringop-overflow
 
 ifeq "$(RELEASE_BUILD)" "1"
 CFLAGS += -O2

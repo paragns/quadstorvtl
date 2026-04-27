@@ -161,11 +161,11 @@ typedef struct bio bio_t;
 #define M_DEVBUF 0
 #define M_QUADSTOR 0
 
-#ifdef QS_DEFINE_SHORT_ALLOC_MACROS
-#define free(ptr, type) kfree(ptr)
-#define malloc(s, type, flags) kmalloc(s, flags)
-#define zalloc(s, type, flags) kzalloc(s, flags)
+#ifdef __KERNEL__
+#define free(ptr,type)        kfree(ptr)
+#define zalloc(s,type,flags)  kzalloc(s,flags)
 #endif
+/* malloc intentionally not defined as macro - use kmalloc directly */
 
 typedef struct block_device iodev_t;
 typedef struct mutex sx_t;
@@ -291,7 +291,7 @@ enum {
   CALLOUT_MPSAFE = 0x01,
 };
 
-#define callout_init(x, mp) init_timer(x)
+#define callout_init(x,mp)	timer_setup((x), NULL, 0)
 
 #define callout_exec(c, t, f, a)                                               \
   do {                                                                         \

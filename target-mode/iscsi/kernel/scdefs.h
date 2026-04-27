@@ -7,9 +7,12 @@
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,23))
 void digest_write_ctio(struct crypto_tfm *tfm, struct iscsi_cmnd *cmnd, struct qsio_scsiio *ctio, u8 *crc);
 void digest_read_ctio(struct crypto_tfm *tfm, struct iscsi_cmnd *cmnd, struct qsio_scsiio *ctio, u8 *crc);
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(4,6,0))
 void digest_write_ctio(struct hash_desc *hash, struct iscsi_cmnd *cmnd, struct qsio_scsiio *ctio, u8 *crc);
 void digest_read_ctio(struct hash_desc *hash, struct iscsi_cmnd *cmnd, struct qsio_scsiio *ctio, u8 *crc);
+#else
+void digest_write_ctio(struct crypto_shash *hash, struct iscsi_cmnd *cmnd, struct qsio_scsiio *ctio, u8 *crc);
+void digest_read_ctio(struct crypto_shash *hash, struct iscsi_cmnd *cmnd, struct qsio_scsiio *ctio, u8 *crc);
 #endif
 #else
 void digest_write_ctio(struct chksum_ctx *mctx, struct iscsi_cmnd *cmnd, struct qsio_scsiio *ctio, u8 *crc);

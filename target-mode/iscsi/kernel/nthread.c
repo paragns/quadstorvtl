@@ -411,8 +411,8 @@ static int write_data(struct iscsi_conn *conn)
 		return 0;
 	}
 	offset = conn->write_offset;
-	idx = offset >> PAGE_CACHE_SHIFT;
-	offset &= ~PAGE_CACHE_MASK;
+	idx = offset >> PAGE_SHIFT;
+	offset &= ~PAGE_MASK;
 
 	sock = conn->sock;
 #ifdef LINUX
@@ -421,7 +421,7 @@ static int write_data(struct iscsi_conn *conn)
 	flags = MSG_DONTWAIT | MSG_NOSIGNAL;
 
 	while (1) {
-		sendsize = PAGE_CACHE_SIZE - offset;
+		sendsize = PAGE_SIZE - offset;
 		if (size <= sendsize) {
 #ifdef LINUX
 			res = sendpage(sock, tio->pvec[idx], offset, size, flags);
@@ -479,7 +479,7 @@ static int write_data(struct iscsi_conn *conn)
 		size -= res;
 	}
  out:
-	conn->write_offset = (idx << PAGE_CACHE_SHIFT) + offset;
+	conn->write_offset = (idx << PAGE_SHIFT) + offset;
  out_iov:
 	conn->write_size = size;
 	if (res == -EAGAIN) {

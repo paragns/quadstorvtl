@@ -18,9 +18,9 @@
 
 #include "queue.h"
 #include <asm/ioctls.h>
+#include <linuxdefs.h>
 #include <exportdefs.h>
 #include <ioctldefs.h>
-#include <linuxdefs.h>
 
 /* =========================================================
  * Socket callbacks — forward declarations

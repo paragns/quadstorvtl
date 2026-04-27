@@ -232,9 +232,12 @@ struct iscsi_conn {
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,23))
 	struct crypto_tfm *rx_digest_tfm;
 	struct crypto_tfm *tx_digest_tfm;
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(4,6,0))
 	struct hash_desc rx_hash;
 	struct hash_desc tx_hash;
+#else
+	struct crypto_shash *rx_hash;
+	struct crypto_shash *tx_hash;
 #endif
 	struct scatterlist hash_sg[ISCSI_CONN_IOV_MAX];
 #else
@@ -454,7 +457,7 @@ d_mmap_t iet_mmap;
 int iet_ioctl(struct cdev *dev, unsigned long cmd, caddr_t arg, int fflag, struct thread *td);
 #endif
 
-#define get_pgcnt(size, offset)	((((size) + ((offset) & ~PAGE_CACHE_MASK)) + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT)
+#define get_pgcnt(size, offset)	((((size) + ((offset) & ~PAGE_MASK)) + PAGE_SIZE - 1) >> PAGE_SHIFT)
 
 static inline void iscsi_cmnd_get_length(struct iscsi_pdu *pdu)
 {

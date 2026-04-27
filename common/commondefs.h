@@ -18,6 +18,10 @@
 
 #ifndef QS_COMMONDEFS_H_
 #define QS_COMMONDEFS_H_ 1
+#ifdef __KERNEL__
+#include <linux/types.h>
+#include <linux/string.h>
+#endif
 
 #define TL_MAX_DISKS	512
 #define TL_MAX_POOLS	512	

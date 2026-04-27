@@ -303,15 +303,15 @@ static void cmnd_skip_pdu(struct iscsi_cmnd *cmnd)
 	assert(addr);
 	size = (size + 3) & -4;
 	conn->read_size = size;
-	for (i = 0; size > PAGE_CACHE_SIZE; i++, size -= PAGE_CACHE_SIZE) {
+	for (i = 0; size > PAGE_SIZE; i++, size -= PAGE_SIZE) {
 		assert(i < ISCSI_CONN_IOV_MAX);
 		conn->read_iov[i].iov_base = addr;
-		conn->read_iov[i].iov_len = PAGE_CACHE_SIZE;
+		conn->read_iov[i].iov_len = PAGE_SIZE;
 	}
 	conn->read_iov[i].iov_base = addr;
 	conn->read_iov[i].iov_len = size;
-	conn->read_msg.msg_iov = conn->read_iov;
-	conn->read_msg.msg_iovlen = ++i;
+	iov_iter_kvec(&conn->read_msg.msg_iter, READ, conn->read_iov, 1, 0);
+	iov_iter_kvec(&conn->read_msg.msg_iter, READ, conn->read_iov, i+1, 0); ++i;
 }
 
 static void iscsi_cmnd_reject(struct iscsi_cmnd *req, int reason)
@@ -538,10 +538,10 @@ static int cmnd_recv_pdu(struct iscsi_conn *conn, struct tio *tio, u32 offset, u
 	assert(offset < tio->offset + tio->size);
 	assert(offset + size <= tio->offset + tio->size);
 
-	idx = offset >> PAGE_CACHE_SHIFT;
-	offset &= ~PAGE_CACHE_MASK;
+	idx = offset >> PAGE_SHIFT;
+	offset &= ~PAGE_MASK;
 
-	conn->read_msg.msg_iov = conn->read_iov;
+	iov_iter_kvec(&conn->read_msg.msg_iter, READ, conn->read_iov, 1, 0);
 	conn->read_size = size = (size + 3) & -4;
 	conn->read_overflow = 0;
 
@@ -551,16 +551,16 @@ static int cmnd_recv_pdu(struct iscsi_conn *conn, struct tio *tio, u32 offset, u
 		addr = (caddr_t)page_address(tio->pvec[idx]);
 		assert(addr);
 		conn->read_iov[i].iov_base =  addr + offset;
-		if (offset + size <= PAGE_CACHE_SIZE) {
+		if (offset + size <= PAGE_SIZE) {
 			conn->read_iov[i].iov_len = size;
-			conn->read_msg.msg_iovlen = ++i;
+			iov_iter_kvec(&conn->read_msg.msg_iter, READ, conn->read_iov, i+1, 0); ++i;
 			break;
 		}
-		conn->read_iov[i].iov_len = PAGE_CACHE_SIZE - offset;
+		conn->read_iov[i].iov_len = PAGE_SIZE - offset;
 		size -= conn->read_iov[i].iov_len;
 		offset = 0;
 		if (++i >= ISCSI_CONN_IOV_MAX) {
-			conn->read_msg.msg_iovlen = i;
+			iov_iter_kvec(&conn->read_msg.msg_iter, READ, conn->read_iov, i, 0);
 			conn->read_overflow = size;
 			conn->read_size -= size;
 			break;
@@ -693,7 +693,7 @@ static int nop_out_start(struct iscsi_conn *conn, struct iscsi_cmnd *cmnd)
 
 	if ((size = cmnd->pdu.datasize)) {
 		size = (size + 3) & -4;
-		conn->read_msg.msg_iov = conn->read_iov;
+		iov_iter_kvec(&conn->read_msg.msg_iter, READ, conn->read_iov, 1, 0);
 		if (cmnd->pdu.bhs.itt != cpu_to_be32(ISCSI_RESERVED_TAG)) {
 			struct tio *tio;
 			int pg_cnt = get_pgcnt(size, 0);
@@ -705,7 +705,7 @@ static int nop_out_start(struct iscsi_conn *conn, struct iscsi_cmnd *cmnd)
 			for (i = 0; i < pg_cnt; i++) {
 				conn->read_iov[i].iov_base
 					= (caddr_t)page_address(tio->pvec[i]);
-				tmp = min_t(u32, size, PAGE_CACHE_SIZE);
+				tmp = min_t(u32, size, PAGE_SIZE);
 				conn->read_iov[i].iov_len = tmp;
 				conn->read_size += tmp;
 				size -= tmp;
@@ -721,7 +721,7 @@ static int nop_out_start(struct iscsi_conn *conn, struct iscsi_cmnd *cmnd)
 		}
 		assert(!size);
 		conn->read_overflow = size;
-		conn->read_msg.msg_iovlen = i;
+		iov_iter_kvec(&conn->read_msg.msg_iter, READ, conn->read_iov, i, 0);
 	}
 
 out:
@@ -770,7 +770,7 @@ static void scsi_cmnd_start(struct iscsi_conn *conn, struct iscsi_cmnd *req)
 	}
 
 	switch (req_hdr->scb[0]) {
-	case SERVICE_ACTION_IN:
+	case SERVICE_ACTION_IN_16:
 		if ((req_hdr->scb[1] & 0x1f) != 0x10)
 			goto error;
 	case INQUIRY:
@@ -1274,9 +1274,17 @@ static void nop_out_exec(struct iscsi_cmnd *req)
 }
 
 #ifdef LINUX
-static void nop_in_timeout(unsigned long data)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+static void nop_in_timeout(struct timer_list *t)
+{
+	struct iscsi_cmnd *req = from_timer(req, t, timer);
 #else
-static void nop_in_timeout(void *data)
+static void nop_in_timeout(unsigned long data)
+{
+#else
+#endif
+static void nop_in_timeout_old(void *data)
+{
 #endif
 {
 	struct iscsi_cmnd *req = (struct iscsi_cmnd *)data;
@@ -1306,8 +1314,12 @@ void send_nop_in(struct iscsi_conn *conn)
 
 	callout_init(&req->timer, CALLOUT_MPSAFE);
 #ifdef LINUX
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
+	timer_setup(&req->timer, nop_in_timeout, 0);
+#else
 	req->timer.data = (unsigned long)req;
 	req->timer.function = nop_in_timeout;
+#endif
 #endif
 
 	if (cmnd_insert_hash_ttt(req, req->target_task_tag)) {

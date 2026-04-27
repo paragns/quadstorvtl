@@ -564,6 +564,10 @@ construct_ctio(struct scsi_cmnd *SCpnt)
 	ctio->ccb_h.queue_fn = ldev_send_ccb;
 	ctio->ccb_h.tdevice = priv->device;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+	ctio->task_attr = MSG_SIMPLE_TASK;
+	ctio->task_tag = SCpnt->tag;
+#else
 	if (scsi_populate_tag_msg(SCpnt, tag)) {
 		switch (tag[0]) {
 		case MSG_HEAD_OF_QUEUE_TASK:
@@ -577,8 +581,9 @@ construct_ctio(struct scsi_cmnd *SCpnt)
 		ctio->task_tag = tag[1];
 	}
 	else {
-		ctio->task_attr = MSG_SIMPLE_TASK; 
+		ctio->task_attr = MSG_SIMPLE_TASK;
 	}
+#endif
 	return ctio;
 }
 

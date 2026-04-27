@@ -95,9 +95,9 @@ MALLOC_DECLARE(M_IETTIO);
 #error "Invalid byte order"
 #endif
 
-#define PAGE_CACHE_SHIFT	PAGE_SHIFT
-#define PAGE_CACHE_MASK		~PAGE_MASK
-#define PAGE_CACHE_SIZE		PAGE_SIZE
+#define PAGE_SHIFT	PAGE_SHIFT
+#define PAGE_MASK		~PAGE_MASK
+#define PAGE_SIZE		PAGE_SIZE
 
 #define READ		BIO_READ
 #define WRITE		BIO_WRITE

@@ -82,8 +82,8 @@ void tio_get(struct tio *tio)
 
 void tio_set(struct tio *tio, u32 size, loff_t offset)
 {
-	tio->idx = offset >> PAGE_CACHE_SHIFT;
-	tio->offset = offset & ~PAGE_CACHE_MASK;
+	tio->idx = offset >> PAGE_SHIFT;
+	tio->offset = offset & ~PAGE_MASK;
 	tio->size = size;
 }
 

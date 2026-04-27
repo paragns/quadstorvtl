@@ -1,15 +1,4 @@
 all:
-	@set -e; \
-	sh ./build.sh
-
+	@echo "Skipping legacy iSCSI kernel module"
 clean:
-	@set -e; \
-	sh ./build.sh clean
-
-clobber:
-	@set -e; \
-	sh ./build.sh clean
-
 install:
-	@set -e; \
-	sh ./build.sh install

@@ -41,9 +41,9 @@ static void sess_param_check(struct iscsi_param_info *info)
 
 	CHECK_PARAM(info, iparam, max_connections, 1, 65535);
 	CHECK_PARAM(info, iparam, max_recv_data_length, 512,
-		    (u32) ((ISCSI_CONN_IOV_MAX - 1) * PAGE_CACHE_SIZE));
+		    (u32) ((ISCSI_CONN_IOV_MAX - 1) * PAGE_SIZE));
 	CHECK_PARAM(info, iparam, max_xmit_data_length, 512,
-		    (u32) ((ISCSI_CONN_IOV_MAX - 1) * PAGE_CACHE_SIZE));
+		    (u32) ((ISCSI_CONN_IOV_MAX - 1) * PAGE_SIZE));
 	CHECK_PARAM(info, iparam, error_recovery_level, 0, 0);
 	CHECK_PARAM(info, iparam, data_pdu_inorder, 1, 1);
 	CHECK_PARAM(info, iparam, data_sequence_inorder, 1, 1);
