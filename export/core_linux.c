@@ -16,21 +16,122 @@
  * Boston, MA  02110-1301, USA.
  */
 
-#include "queue.h"
+/*
+ * KERNEL COMPATIBILITY NOTES (for this vendor RHEL8 4.18 build)
+ * =============================================================
+ * The quadstor headers (linuxdefs.h) define macros like:
+ *   #define free(ptr,type)      kfree(ptr)
+ *   #define malloc(s,t,f)       kmalloc(s,f)
+ *   #define zalloc(s,t,f)       kzalloc(s,f)
+ *   #define printf              printk
+ *   #define ticks_to_msecs      jiffies_to_msecs
+ *   #define mtx_lock            spin_lock
+ *   #define mtx_unlock          spin_unlock
+ *   #define copyin(ua,ka,ln)    copy_from_user(ka,ua,ln)
+ *   #define copyout(ka,ua,ln)   copy_to_user(ua,ka,ln)
+ *   #define pause(s,m)          msleep(m)
+ *
+ * These macros corrupt:
+ *   (a) struct field names inside exportdefs.h / commondefs.h when those
+ *       headers are included after linuxdefs.h
+ *   (b) the kcbs struct initializer field names in this file
+ *
+ * Solution: include linux kernel headers first, then undef the colliding
+ * macros, include the quadstor headers (so their typedefs/structs parse
+ * cleanly), then re-undef before the kcbs initializer and re-restore after.
+ *
+ * Additional kernel API changes fixed here:
+ *   - sock_create_kern: gained struct net* arg (4.2)
+ *   - sk_data_ready: lost int count arg (3.15)
+ *   - ops->accept: gained bool kern arg (4.11)
+ *   - ops->getname: dropped addrlen ptr, returns len (backported in RHEL8 4.18)
+ *   - bio->bi_rw -> bi_opf, READ/WRITE -> REQ_OP_* (4.8)
+ *   - bio->bi_sector -> bi_iter.bi_sector (3.14)
+ *   - bio->bi_bdev: removed in vendor 4.18; store iodev in bi_private instead
+ *   - bio_end_io: lost int err arg (4.3); use blk_status_to_errno(bi_status)
+ *   - bio_free_pages: now exported by kernel; rename ours to qs_bio_free_pages
+ *   - generic_make_request -> submit_bio (5.9)
+ *   - __malloc / __free / __free: conflict with GCC/kernel cleanup macros
+ */
+
+/* ---- Step 1: pull in kernel headers directly ---- */
 #include <asm/ioctls.h>
+#include <linux/bio.h>
+#include <linux/blk_types.h>
+#include <linux/blkdev.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/in.h>
+#include <linux/kernel.h>
+#include <linux/kthread.h>
+#include <linux/list.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/net.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/tcp.h>
+#include <linux/types.h>
+#include <linux/version.h>
+#include <linux/vmalloc.h>
+#include <net/sock.h>
+#include <scsi/scsi.h>
+
+
+/* ---- Step 2: undef every macro that collides with quadstor header
+ *              struct/field names BEFORE including those headers ---- */
+#ifdef free
+#undef free
+#endif
+#ifdef malloc
+#undef malloc
+#endif
+#ifdef zalloc
+#undef zalloc
+#endif
+#ifdef printf
+#undef printf
+#endif
+#ifdef sprintf
+#undef sprintf
+#endif
+#ifdef snprintf
+#undef snprintf
+#endif
+#ifdef ticks_to_msecs
+#undef ticks_to_msecs
+#endif
+#ifdef mtx_lock
+#undef mtx_lock
+#endif
+#ifdef mtx_unlock
+#undef mtx_unlock
+#endif
+#ifdef copyin
+#undef copyin
+#endif
+#ifdef copyout
+#undef copyout
+#endif
+#ifdef pause
+#undef pause
+#endif
+
+/* ---- Step 3: now include quadstor headers safely ---- */
+#include "queue.h"
 #include <exportdefs.h>
 #include <ioctldefs.h>
+
+/* ---- Step 4: re-include linuxdefs.h to get the typedefs/macros we DO
+ *              need for the function bodies below ---- */
 #include <linuxdefs.h>
 
-/* Corelib interface definitions */
+/* =========================================================
+ * Socket callbacks — forward declarations
+ * =========================================================*/
 
-/* Socket related stuff */
-
-/*
- * FIX #1: sk_data_ready lost its 'int count' param in kernel 3.15.
- * Forward-declare with the right signature so sock_activate()'s
- * assignment compiles without an incompatible-pointer-types error.
- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)
 static void sys_sock_data_ready(struct sock *sk);
 #else
@@ -38,6 +139,10 @@ static void sys_sock_data_ready(struct sock *sk, int count);
 #endif
 static void sys_sock_write_space(struct sock *sk);
 static void sys_sock_state_change(struct sock *sk);
+
+/* =========================================================
+ * Socket implementation
+ * =========================================================*/
 
 static int sys_sock_has_read_data(sock_t *sys_sock) {
   int avail = 0;
@@ -66,10 +171,9 @@ static int sys_sock_read(sock_t *sys_sock, void *buf, int len) {
                           MSG_DONTWAIT | MSG_NOSIGNAL);
   if (retval > 0)
     return retval;
-  else if (retval == -EAGAIN || retval == -EINTR)
+  if (retval == -EAGAIN || retval == -EINTR)
     return 0;
-  else
-    return retval;
+  return retval;
 }
 
 static void sys_sock_free(sock_t *sys_sock) {
@@ -119,10 +223,9 @@ static int sys_sock_write_page(sock_t *sys_sock, pagestruct_t *page, int offset,
   retval = sendpage(sock, page, offset, len, flags);
   if (retval > 0)
     return retval;
-  else if (retval == -EAGAIN || retval == -EINTR)
+  if (retval == -EAGAIN || retval == -EINTR)
     return 0;
-  else
-    return retval;
+  return retval;
 }
 
 static int sys_sock_write(sock_t *sys_sock, void *buf, int len) {
@@ -137,10 +240,9 @@ static int sys_sock_write(sock_t *sys_sock, void *buf, int len) {
   retval = kernel_sendmsg(sys_sock->sock, &msg, &iov, 1, len);
   if (retval > 0)
     return retval;
-  else if (retval == -EAGAIN || retval == -EINTR)
+  if (retval == -EAGAIN || retval == -EINTR)
     return 0;
-  else
-    return retval;
+  return retval;
 }
 
 static sock_t *sys_sock_create(void *priv) {
@@ -151,10 +253,7 @@ static sock_t *sys_sock_create(void *priv) {
   if (unlikely(!sys_sock))
     return NULL;
 
-  /*
-   * FIX #2: sock_create_kern() gained a 'struct net *' first argument
-   * in kernel 4.2.
-   */
+  /* sock_create_kern gained struct net* first arg in kernel 4.2 */
   retval = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
                             &sys_sock->sock);
   if (unlikely(retval < 0)) {
@@ -195,14 +294,13 @@ static sock_t *sys_sock_accept(sock_t *sys_sock, void *priv, int *error,
   int retval;
 
   new_syssock = sys_sock_create(priv);
+  if (!new_syssock)
+    return NULL;
   newsock = new_syssock->sock;
   newsock->type = sock->type;
   newsock->ops = sock->ops;
 
-  /*
-   * FIX #3: ops->accept() gained a 'bool kern' final argument in
-   * kernel 4.11.
-   */
+  /* ops->accept gained bool kern arg in 4.11 */
   retval = sock->ops->accept(sock, newsock, O_NONBLOCK, false);
   if (retval != 0) {
     sys_sock_close(new_syssock, 1);
@@ -213,9 +311,10 @@ static sock_t *sys_sock_accept(sock_t *sys_sock, void *priv, int *error,
   sock_activate(new_syssock);
 
   /*
-   * FIX #4: ops->getname() dropped its addrlen pointer and now returns
-   * the length directly.  This was backported into the RHEL8 4.18
-   * vendor kernel, so use >= 4,17,0 as the practical cutoff.
+   * ops->getname() dropped its int *addrlen pointer and now returns
+   * the length directly.  Red Hat backported this into their 4.18
+   * vendor kernel (the build kernel here is 4.18.0-*.el8.qtm).
+   * Use >= 4,17,0 as the cutoff to be safe.
    */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
   retval =
@@ -262,9 +361,11 @@ static int sys_sock_bind(sock_t *sys_sock, uint32_t addr, uint16_t port) {
       sock->ops->bind(sock, (struct sockaddr *)&saddr_in, sizeof(saddr_in));
   if (retval < 0)
     return -1;
+
   retval = sock->ops->listen(sock, 1024);
   if (retval < 0)
     return -1;
+
   sock_activate(sys_sock);
   return 0;
 }
@@ -276,18 +377,16 @@ static int sys_sock_connect(sock_t *sys_sock, uint32_t addr,
   int disabled = 1;
   int retval;
 
-  if (!local_addr || (local_addr == addr))
-    goto skip_bind;
+  if (local_addr && (local_addr != addr)) {
+    memset(&saddr_in, 0, sizeof(saddr_in));
+    saddr_in.sin_family = AF_INET;
+    saddr_in.sin_addr.s_addr = local_addr;
+    retval =
+        sock->ops->bind(sock, (struct sockaddr *)&saddr_in, sizeof(saddr_in));
+    if (retval < 0)
+      return -1;
+  }
 
-  memset(&saddr_in, 0, sizeof(saddr_in));
-  saddr_in.sin_family = AF_INET;
-  saddr_in.sin_addr.s_addr = local_addr;
-  retval =
-      sock->ops->bind(sock, (struct sockaddr *)&saddr_in, sizeof(saddr_in));
-  if (retval < 0)
-    return -1;
-
-skip_bind:
   memset(&saddr_in, 0, sizeof(saddr_in));
   saddr_in.sin_family = AF_INET;
   saddr_in.sin_port = htons(port);
@@ -297,10 +396,15 @@ skip_bind:
                               sizeof(saddr_in), O_NONBLOCK);
   if (retval != 0 && retval != -EINPROGRESS)
     return -1;
+
   kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY, (void *)&disabled,
                     sizeof(disabled));
   return 0;
 }
+
+/* =========================================================
+ * Debug helpers
+ * =========================================================*/
 
 static void debug_warn(char *fmt, ...) {
   va_list args;
@@ -326,6 +430,10 @@ static void debug_check(void) {
 #endif
 }
 
+/* =========================================================
+ * Tick / time helpers
+ * =========================================================*/
+
 unsigned long __msecs_to_ticks(unsigned long msecs) {
   return msecs_to_jiffies(msecs);
 }
@@ -335,6 +443,10 @@ unsigned long __ticks_to_msecs(unsigned long ticks) {
 }
 
 static uint32_t get_ticks(void) { return jiffies; }
+
+/* =========================================================
+ * Block device helpers
+ * =========================================================*/
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32))
 int bdev_unmap_support(iodev_t *iodev) {
@@ -362,6 +474,7 @@ iodev_t *open_block_device(const char *devpath, uint64_t *size,
     *error = -1;
     return NULL;
   }
+
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24))
   *sector_size = bdev_hardsect_size(b_dev);
 #else
@@ -383,11 +496,15 @@ static void close_block_device(iodev_t *b_dev) {
 #endif
 }
 
+/* =========================================================
+ * Page / memory helpers
+ * =========================================================*/
+
 static pagestruct_t *vm_pg_alloc(allocflags_t aflags) {
   int flags = GFP_NOIO | (aflags ? __GFP_ZERO : 0);
 
   if (aflags & Q_SFBUF)
-    aflags |= __GFP_HIGHMEM;
+    flags |= __GFP_HIGHMEM;
   return alloc_page(flags);
 }
 
@@ -401,6 +518,10 @@ void *vm_pg_map(pagestruct_t **pp, int pg_count) {
 }
 
 void vm_pg_unmap(void *maddr, int pg_count) { vunmap(maddr); }
+
+/* =========================================================
+ * Slab / alloc helpers
+ * =========================================================*/
 
 static void *uma_zcreate(const char *name, size_t size) {
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 23))
@@ -440,10 +561,7 @@ static void *__zalloc(size_t size, int type, allocflags_t aflags) {
   return ret;
 }
 
-/*
- * FIX #5: kernel 4.18+ defines __malloc as a GCC attribute macro —
- * undef before our local function of the same name.
- */
+/* kernel 4.18+ defines __malloc as a GCC attribute macro — undef first */
 #ifdef __malloc
 #undef __malloc
 #endif
@@ -457,14 +575,15 @@ static void *__malloc(size_t size, int type, allocflags_t aflags) {
   return ret;
 }
 
-/*
- * FIX #6: kernel 5.9+ defines __free as a cleanup macro —
- * undef before our local wrapper.
- */
+/* kernel 5.9+ defines __free as a cleanup macro — undef first */
 #ifdef __free
 #undef __free
 #endif
 static void __free(void *ptr) { kfree(ptr); }
+
+/* =========================================================
+ * Cache globals
+ * =========================================================*/
 
 uma_t *mtx_cache;
 uma_t *sx_cache;
@@ -473,6 +592,11 @@ uma_t *cv_cache;
 uma_t *tpriv_cache;
 #endif
 uma_t *bpriv_cache;
+
+/* =========================================================
+ * Mutex / spinlock helpers
+ * (use kernel names directly to avoid linuxdefs.h macro confusion)
+ * =========================================================*/
 
 static mtx_t *mtx_alloc(const char *name) {
   mtx_t *mtx;
@@ -485,12 +609,7 @@ static mtx_t *mtx_alloc(const char *name) {
 
 static void mtx_free(mtx_t *mtx) { kmem_cache_free(mtx_cache, mtx); }
 
-/* Use plain kernel primitives here — the linuxdefs.h macros are still
- * active at this point so we call spin_*/
-    mutex_ *directly to avoid *any macro confusion inside function bodies.* /
-    static void __mtx_lock(mtx_t *mtx) {
-  spin_lock(mtx);
-}
+static void __mtx_lock(mtx_t *mtx) { spin_lock(mtx); }
 static void __mtx_unlock(mtx_t *mtx) { spin_unlock(mtx); }
 
 static void __mtx_lock_intr(mtx_t *mtx, void *data) {
@@ -502,6 +621,10 @@ static void __mtx_unlock_intr(mtx_t *mtx, void *data) {
   unsigned long *flags = data;
   spin_unlock_irqrestore(mtx, *flags);
 }
+
+/* =========================================================
+ * Shared mutex (sx) helpers — backed by struct mutex
+ * =========================================================*/
 
 static sx_t *shx_alloc(const char *name) {
   sx_t *sx;
@@ -518,6 +641,10 @@ static void shx_xunlock(sx_t *sx) { mutex_unlock(sx); }
 static void shx_slock(sx_t *sx) { mutex_lock(sx); }
 static void shx_sunlock(sx_t *sx) { mutex_unlock(sx); }
 static int shx_xlocked(sx_t *sx) { return mutex_is_locked(sx); }
+
+/* =========================================================
+ * Condition variable helpers — backed by wait_queue_head_t
+ * =========================================================*/
 
 static cv_t *cv_alloc(const char *name) {
   cv_t *cv;
@@ -558,17 +685,25 @@ static long cv_timedwait(cv_t *cv, mtx_t *mtx, void *data, int timo) {
   return ret;
 }
 
+/*
+ * cv_wait_sig uses a plain spinlock (mtx_t), NOT a mutex.
+ * Call spin_lock/unlock directly to avoid any macro confusion.
+ */
 static void cv_wait_sig(cv_t *cv, mtx_t *mtx, int intr) {
   DEFINE_WAIT(wait);
 
   add_wait_queue_exclusive(cv, &wait);
   set_current_state(intr ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
-  mutex_unlock(mtx);
+  spin_unlock(mtx);
   schedule();
-  mutex_lock(mtx);
+  spin_lock(mtx);
   set_current_state(TASK_RUNNING);
   remove_wait_queue(cv, &wait);
 }
+
+/* =========================================================
+ * Wakeup helpers
+ * =========================================================*/
 
 static void wakeup(cv_t *cv, mtx_t *mtx) {
   unsigned long flags;
@@ -615,10 +750,14 @@ static void wakeup_one_compl(cv_t *cv, mtx_t *mtx, int *done) {
 static void wakeup_one_unlocked(cv_t *cv) { wake_up(cv); }
 static void wakeup_unlocked(cv_t *cv) { wake_up_all(cv); }
 
+/* =========================================================
+ * Misc helpers
+ * =========================================================*/
+
 static uint64_t get_availmem(void) {
   struct sysinfo si;
   si_meminfo(&si);
-  return (si.totalram * si.mem_unit);
+  return (uint64_t)si.totalram * si.mem_unit;
 }
 
 static void bdev_marker(iodev_t *b_dev, struct tpriv *tpriv) {
@@ -675,18 +814,7 @@ static int __kernel_thread_check(int *flags, int bit) {
 }
 
 static void sched_prio(int prio) {
-  int set_prio;
-  switch (prio) {
-  case QS_PRIO_SWP:
-    set_prio = -20;
-    break;
-  case QS_PRIO_INOD:
-    set_prio = -19;
-    break;
-  default:
-    DEBUG_BUG_ON(1);
-    return;
-  }
+  int set_prio = (prio == QS_PRIO_SWP) ? -20 : -19;
   set_user_nice(current, set_prio);
 }
 
@@ -697,22 +825,23 @@ static int __kernel_thread_stop(kproc_t *task, int *flags, void *chan,
 
 static int get_cpu_count(void) { return num_online_cpus(); }
 
-/*
- * bio_priv: private payload attached to every bio we allocate.
- *
- * FIX #7: bi_bdev was removed in some RHEL8 4.18 vendor builds and in
- * upstream 5.12.  Cache the iodev here so send_bio() and bio_get_iodev()
- * never need to touch bi_bdev at all.
- */
+/* =========================================================
+ * BIO helpers
+ * =========================================================*/
+
 struct bio_priv {
   void *priv;
   void (*end_bio_func)(bio_t *bio, int err);
+  /*
+   * bi_bdev was removed in some vendor RHEL8 4.18 builds.
+   * Store iodev here so send_bio / bio_get_iodev never touch bi_bdev.
+   */
   iodev_t *iodev;
 };
 
 /*
- * FIX #8: bio->bi_end_io callback dropped its 'int error' parameter in
- * kernel 4.3.  On >= 4.3 retrieve the error from bio->bi_status.
+ * bio->bi_end_io lost its 'int error' parameter in kernel 4.3.
+ * On 4.3+ retrieve the error from blk_status_to_errno(bio->bi_status).
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 static void bio_end_bio(bio_t *bio) {
@@ -738,20 +867,20 @@ static void bio_end_bio(bio_t *bio, int err) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32))
 int bio_unmap(iodev_t *iodev, void *cp, uint64_t start_sector, uint32_t blocks,
               uint32_t shift, void (*end_bio_func)(bio_t *, int), void *priv) {
-  int err;
   int diff = (shift - 9);
-
   if (diff) {
     start_sector <<= diff;
     blocks <<= diff;
   }
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35)
-  err = blkdev_issue_discard(iodev, start_sector, blocks, GFP_NOIO,
-                             DISCARD_FL_WAIT);
+  return blkdev_issue_discard(iodev, start_sector, blocks, GFP_NOIO,
+                              DISCARD_FL_WAIT)
+             ? -1
+             : 1;
 #else
-  err = blkdev_issue_discard(iodev, start_sector, blocks, GFP_NOIO, 0);
+  return blkdev_issue_discard(iodev, start_sector, blocks, GFP_NOIO, 0) ? -1
+                                                                        : 1;
 #endif
-  return err ? -1 : 1;
 }
 #else
 int bio_unmap(iodev_t *iodev, void *cp, uint64_t start_sector, uint32_t blocks,
@@ -766,7 +895,7 @@ void g_destroy_bio(bio_t *bio) {
 }
 
 /*
- * FIX #9: bio->bi_rw replaced by bio->bi_opf in kernel 4.8.
+ * bio->bi_rw replaced by bio->bi_opf + REQ_OP_* in kernel 4.8.
  */
 static void bio_set_command(bio_t *bio, int cmd) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
@@ -824,7 +953,7 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
   struct bio_priv *bpriv;
   struct bio *bio;
 
-  bio = bio_alloc(M_NOWAIT, bio_vec_count);
+  bio = bio_alloc(GFP_NOIO, bio_vec_count);
   if (unlikely(!bio))
     return NULL;
 
@@ -834,18 +963,14 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
     return NULL;
   }
 
-  /* FIX #10: bi_sector moved into bi_iter in kernel 3.14 */
+  /* bi_sector moved into bi_iter in 3.14 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   bio->bi_iter.bi_sector = bi_sector;
 #else
   bio->bi_sector = bi_sector;
 #endif
 
-  /*
-   * FIX #7b: bio_set_dev() available from 4.14, handles bi_bdev /
-   * bi_disk correctly.  We also stash iodev in bpriv so retrieval
-   * never depends on bi_bdev being present.
-   */
+  /* bio_set_dev() available from 4.14; older kernels use bi_bdev directly */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
   bio_set_dev(bio, iodev);
 #else
@@ -854,7 +979,7 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
 
   bpriv->priv = consumer;
   bpriv->end_bio_func = end_bio_func;
-  bpriv->iodev = iodev;
+  bpriv->iodev = iodev; /* safe retrieval regardless of kernel ver */
   bio->bi_end_io = bio_end_bio;
   bio->bi_private = bpriv;
   bio_set_command(bio, rw);
@@ -862,8 +987,8 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
 }
 
 /*
- * FIX #11: bio_free_pages() is exported by the kernel from ~4.13.
- * Rename ours to qs_bio_free_pages to avoid the symbol clash.
+ * bio_free_pages() is exported by the kernel since ~4.13.
+ * Rename ours to avoid the 'static declaration follows non-static' error.
  */
 static void qs_bio_free_pages(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
@@ -907,24 +1032,6 @@ static void *bio_get_caller(bio_t *bio) {
   return bpriv->priv;
 }
 
-/* FIX #7c: always retrieve iodev from bpriv, never from bi_bdev. */
-static iodev_t *send_bio(bio_t *bio) {
-  struct bio_priv *bpriv = bio->bi_private;
-  iodev_t *iodev = bpriv->iodev;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-  submit_bio(bio);
-#else
-  generic_make_request(bio);
-#endif
-  return iodev;
-}
-
-static iodev_t *bio_get_iodev(bio_t *bio) {
-  struct bio_priv *bpriv = bio->bi_private;
-  return bpriv->iodev;
-}
-
 static uint64_t bio_get_start_sector(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   return bio->bi_iter.bi_sector;
@@ -942,17 +1049,44 @@ static uint32_t bio_get_max_pages(iodev_t *iodev) {
 }
 
 static uint32_t bio_get_nr_sectors(bio_t *bio) { return bio_sectors(bio); }
+
+/*
+ * bi_bdev removed in vendor RHEL8 4.18 and upstream 5.12.
+ * Use bpriv->iodev stored at allocation time instead.
+ * generic_make_request() renamed to submit_bio() in 5.9.
+ */
+static iodev_t *send_bio(bio_t *bio) {
+  struct bio_priv *bpriv = bio->bi_private;
+  iodev_t *iodev = bpriv->iodev;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+  submit_bio(bio);
+#else
+  generic_make_request(bio);
+#endif
+  return iodev;
+}
+
+static iodev_t *bio_get_iodev(bio_t *bio) {
+  struct bio_priv *bpriv = bio->bi_private;
+  return bpriv->iodev;
+}
+
+/* =========================================================
+ * Process helpers
+ * =========================================================*/
+
 static void processor_yield(void) { yield(); }
 
 static int kproc_create(void *fn, void *data, kproc_t **task,
                         const char namefmt[], ...) {
   va_list args;
-  kproc_t *tsk;
   char name[64];
+  kproc_t *tsk;
 
   va_start(args, namefmt);
   vsprintf(name, namefmt, args);
   va_end(args);
+
   tsk = kthread_run(fn, data, name);
   if (IS_ERR(tsk))
     return -1;
@@ -985,7 +1119,6 @@ static void thread_start(struct tpriv *tpriv) {
 #endif
 }
 static void thread_end(struct tpriv *tpriv) {}
-
 #else
 static void thread_start(struct tpriv *tpriv) {
   struct io_context *gioc = tpriv->data;
@@ -997,7 +1130,6 @@ static void thread_start(struct tpriv *tpriv) {
   else
     tpriv->data = current->io_context;
 }
-
 static void thread_end(struct tpriv *tpriv) {
   struct io_context *ioc = current->io_context;
   if (!ioc)
@@ -1009,32 +1141,17 @@ static void thread_end(struct tpriv *tpriv) {
 }
 #endif
 
-/*
- * FIX #12 — struct qs_kern_cbs field-name / macro collision
- * ----------------------------------------------------------
- * linuxdefs.h defines convenience macros that are still active here:
+/* =========================================================
+ * kcbs struct initializer
  *
- *   #define free(ptr,type)        kfree(ptr)
- *   #define malloc(s,type,flags)  kmalloc(s,flags)
- *   #define zalloc(s,type,flags)  kzalloc(s,flags)
- *   #define printf                printk
- *   #define sprintf               (nothing — but snprintf clashes too)
- *   #define ticks_to_msecs        jiffies_to_msecs
- *   #define mtx_lock              spin_lock
- *   #define mtx_unlock            spin_unlock
- *   #define copyin(ua,ka,ln)      copy_from_user(ka,ua,ln)
- *   #define copyout(ka,ua,ln)     copy_to_user(ua,ka,ln)
- *   #define pause(s,m)            msleep(m)
+ * linuxdefs.h defines macros that collide with field names:
+ *   free, malloc, zalloc, printf, sprintf, snprintf,
+ *   ticks_to_msecs, mtx_lock, mtx_unlock, copyin, copyout, pause
  *
- * When the compiler sees the qs_kern_cbs struct literal below, the
- * preprocessor rewrites every matching field name before the compiler
- * ever sees the struct — e.g. ".mtx_lock = ..." becomes
- * ".spin_lock = ..." which is not a member of the struct.
- *
- * Solution: push and undef every colliding macro for the duration of
- * the struct literal, then pop to restore them.
- * (#pragma push/pop_macro is supported by GCC >= 4.4.)
- */
+ * We included linuxdefs.h earlier (needed for typedefs used in
+ * function bodies above).  Now undef them all before the struct
+ * literal so the compiler sees the real field names, then restore.
+ * =========================================================*/
 #pragma push_macro("free")
 #pragma push_macro("malloc")
 #pragma push_macro("zalloc")
@@ -1130,14 +1247,14 @@ static struct qs_kern_cbs kcbs = {
     .bio_get_command = bio_get_command,
     .bio_get_caller = bio_get_caller,
     .bio_get_length = bio_get_length,
+    .bio_unmap = bio_unmap,
+    .bdev_unmap_support = bdev_unmap_support,
     .send_bio = send_bio,
     .bio_get_iodev = bio_get_iodev,
     .bio_get_start_sector = bio_get_start_sector,
-    .bio_get_nr_sectors = bio_get_nr_sectors,
     .bio_get_max_pages = bio_get_max_pages,
+    .bio_get_nr_sectors = bio_get_nr_sectors,
     .g_destroy_bio = g_destroy_bio,
-    .bio_unmap = bio_unmap,
-    .bdev_unmap_support = bdev_unmap_support,
     .processor_yield = processor_yield,
     .kproc_create = kproc_create,
     .thread_start = thread_start,
@@ -1159,7 +1276,6 @@ static struct qs_kern_cbs kcbs = {
     .sock_nopush = sys_sock_nopush,
 };
 
-/* Restore every macro suppressed for the struct initialiser above */
 #pragma pop_macro("pause")
 #pragma pop_macro("copyout")
 #pragma pop_macro("copyin")
@@ -1173,9 +1289,9 @@ static struct qs_kern_cbs kcbs = {
 #pragma pop_macro("malloc")
 #pragma pop_macro("free")
 
-/* ------------------------------------------------------------------ */
-/* Socket callbacks — defined after kcbs so they can reference it     */
-/* ------------------------------------------------------------------ */
+/* =========================================================
+ * Socket callbacks — defined after kcbs so they can call into it
+ * =========================================================*/
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)
 static void sys_sock_data_ready(struct sock *sk)
@@ -1200,7 +1316,6 @@ static void sys_sock_write_space(struct sock *sk) {
 static void sys_sock_state_change(struct sock *sk) {
   sock_t *sys_sock = sk->sk_user_data;
   int newstate;
-
   if (!sys_sock)
     return;
   switch (sk->sk_state) {
@@ -1214,11 +1329,11 @@ static void sys_sock_state_change(struct sock *sk) {
   (*kcbs.sock_state_change)(sys_sock->priv, newstate);
 }
 
-/* ------------------------------------------------------------------ */
-/* Character device / ioctl                                            */
-/* ------------------------------------------------------------------ */
+/* =========================================================
+ * Character device / ioctl
+ * =========================================================*/
 
-sx_t ioctl_lock;
+static struct mutex ioctl_lock;
 
 static int coremod_open(vnode_t *i, struct file *f) { return 0; }
 static int coremod_release(vnode_t *i, struct file *f) { return 0; }
@@ -1282,10 +1397,9 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
     if ((retval = copy_from_user(&fc_rule_config, userp,
                                  sizeof(fc_rule_config))) != 0)
       break;
-    if (cmd == TLTARGIOCADDFCRULE)
-      retval = (*kcbs.target_add_fc_rule)(&fc_rule_config);
-    else
-      retval = (*kcbs.target_remove_fc_rule)(&fc_rule_config);
+    retval = (cmd == TLTARGIOCADDFCRULE)
+                 ? (*kcbs.target_add_fc_rule)(&fc_rule_config)
+                 : (*kcbs.target_remove_fc_rule)(&fc_rule_config);
     break;
 
   case TLTARGIOCNEWBLKDEV:
@@ -1438,9 +1552,9 @@ static struct file_operations coremod_fops = {
 #endif
 };
 
-/* ------------------------------------------------------------------ */
-/* Cache init / exit                                                   */
-/* ------------------------------------------------------------------ */
+/* =========================================================
+ * Cache init / exit
+ * =========================================================*/
 
 static void exit_caches(void) {
   if (bpriv_cache)
@@ -1488,9 +1602,9 @@ static int init_caches(void) {
   return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Module interface registration                                       */
-/* ------------------------------------------------------------------ */
+/* =========================================================
+ * Module interface
+ * =========================================================*/
 
 #define coremod THIS_MODULE
 
@@ -1505,15 +1619,10 @@ int vtdevice_register_interface(struct qs_interface_cbs *icbs) {
 }
 
 void vtdevice_unregister_interface(struct qs_interface_cbs *icbs) {
-  int retval;
-  retval = __device_unregister_interface(icbs);
+  int retval = __device_unregister_interface(icbs);
   if (retval == 0)
     module_release(coremod);
 }
-
-/* ------------------------------------------------------------------ */
-/* Module init / exit                                                  */
-/* ------------------------------------------------------------------ */
 
 static int dev_major;
 
