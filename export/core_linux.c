@@ -16,122 +16,15 @@
  * Boston, MA  02110-1301, USA.
  */
 
-/*
- * KERNEL COMPATIBILITY NOTES (for this vendor RHEL8 4.18 build)
- * =============================================================
- * The quadstor headers (linuxdefs.h) define macros like:
- *   #define free(ptr,type)      kfree(ptr)
- *   #define malloc(s,t,f)       kmalloc(s,f)
- *   #define zalloc(s,t,f)       kzalloc(s,f)
- *   #define printf              printk
- *   #define ticks_to_msecs      jiffies_to_msecs
- *   #define mtx_lock            spin_lock
- *   #define mtx_unlock          spin_unlock
- *   #define copyin(ua,ka,ln)    copy_from_user(ka,ua,ln)
- *   #define copyout(ka,ua,ln)   copy_to_user(ua,ka,ln)
- *   #define pause(s,m)          msleep(m)
- *
- * These macros corrupt:
- *   (a) struct field names inside exportdefs.h / commondefs.h when those
- *       headers are included after linuxdefs.h
- *   (b) the kcbs struct initializer field names in this file
- *
- * Solution: include linux kernel headers first, then undef the colliding
- * macros, include the quadstor headers (so their typedefs/structs parse
- * cleanly), then re-undef before the kcbs initializer and re-restore after.
- *
- * Additional kernel API changes fixed here:
- *   - sock_create_kern: gained struct net* arg (4.2)
- *   - sk_data_ready: lost int count arg (3.15)
- *   - ops->accept: gained bool kern arg (4.11)
- *   - ops->getname: dropped addrlen ptr, returns len (backported in RHEL8 4.18)
- *   - bio->bi_rw -> bi_opf, READ/WRITE -> REQ_OP_* (4.8)
- *   - bio->bi_sector -> bi_iter.bi_sector (3.14)
- *   - bio->bi_bdev: removed in vendor 4.18; store iodev in bi_private instead
- *   - bio_end_io: lost int err arg (4.3); use blk_status_to_errno(bi_status)
- *   - bio_free_pages: now exported by kernel; rename ours to qs_bio_free_pages
- *   - generic_make_request -> submit_bio (5.9)
- *   - __malloc / __free / __free: conflict with GCC/kernel cleanup macros
- */
-
-/* ---- Step 1: pull in kernel headers directly ---- */
-#include <asm/ioctls.h>
-#include <linux/bio.h>
-#include <linux/blk_types.h>
-#include <linux/blkdev.h>
-#include <linux/completion.h>
-#include <linux/delay.h>
-#include <linux/in.h>
-#include <linux/kernel.h>
-#include <linux/kthread.h>
-#include <linux/list.h>
-#include <linux/mm.h>
-#include <linux/module.h>
-#include <linux/mutex.h>
-#include <linux/net.h>
-#include <linux/slab.h>
-#include <linux/spinlock.h>
-#include <linux/string.h>
-#include <linux/tcp.h>
-#include <linux/types.h>
-#include <linux/version.h>
-#include <linux/vmalloc.h>
-#include <net/sock.h>
-#include <scsi/scsi.h>
-
-
-/* ---- Step 2: undef every macro that collides with quadstor header
- *              struct/field names BEFORE including those headers ---- */
-#ifdef free
-#undef free
-#endif
-#ifdef malloc
-#undef malloc
-#endif
-#ifdef zalloc
-#undef zalloc
-#endif
-#ifdef printf
-#undef printf
-#endif
-#ifdef sprintf
-#undef sprintf
-#endif
-#ifdef snprintf
-#undef snprintf
-#endif
-#ifdef ticks_to_msecs
-#undef ticks_to_msecs
-#endif
-#ifdef mtx_lock
-#undef mtx_lock
-#endif
-#ifdef mtx_unlock
-#undef mtx_unlock
-#endif
-#ifdef copyin
-#undef copyin
-#endif
-#ifdef copyout
-#undef copyout
-#endif
-#ifdef pause
-#undef pause
-#endif
-
-/* ---- Step 3: now include quadstor headers safely ---- */
 #include "queue.h"
+#include <asm/ioctls.h>
 #include <exportdefs.h>
 #include <ioctldefs.h>
-
-/* ---- Step 4: re-include linuxdefs.h to get the typedefs/macros we DO
- *              need for the function bodies below ---- */
 #include <linuxdefs.h>
 
 /* =========================================================
  * Socket callbacks — forward declarations
  * =========================================================*/
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)
 static void sys_sock_data_ready(struct sock *sk);
 #else
@@ -147,7 +40,6 @@ static void sys_sock_state_change(struct sock *sk);
 static int sys_sock_has_read_data(sock_t *sys_sock) {
   int avail = 0;
   int retval;
-
   retval = sys_sock->sock->ops->ioctl(sys_sock->sock, SIOCINQ,
                                       (unsigned long)&avail);
   return (retval >= 0) ? avail : 0;
@@ -203,7 +95,6 @@ static void sock_deactivate(sock_t *sys_sock) {
 
 static void sys_sock_close(sock_t *sys_sock, int linger) {
   struct socket *sock = sys_sock->sock;
-
   if (!linger)
     kernel_setsockopt(sock, SOL_SOCKET, SO_LINGER, (void *)&linger,
                       sizeof(linger));
@@ -216,11 +107,10 @@ static int sys_sock_write_page(sock_t *sys_sock, pagestruct_t *page, int offset,
                                int len) {
   struct socket *sock = sys_sock->sock;
   ssize_t (*sendpage)(struct socket *, pagestruct_t *, int, size_t, int);
-  int flags = MSG_DONTWAIT | MSG_NOSIGNAL;
   int retval;
 
   sendpage = sock->ops->sendpage ? sock->ops->sendpage : sock_no_sendpage;
-  retval = sendpage(sock, page, offset, len, flags);
+  retval = sendpage(sock, page, offset, len, MSG_DONTWAIT | MSG_NOSIGNAL);
   if (retval > 0)
     return retval;
   if (retval == -EAGAIN || retval == -EINTR)
@@ -253,7 +143,6 @@ static sock_t *sys_sock_create(void *priv) {
   if (unlikely(!sys_sock))
     return NULL;
 
-  /* sock_create_kern gained struct net* first arg in kernel 4.2 */
   retval = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
                             &sys_sock->sock);
   if (unlikely(retval < 0)) {
@@ -300,7 +189,6 @@ static sock_t *sys_sock_accept(sock_t *sys_sock, void *priv, int *error,
   newsock->type = sock->type;
   newsock->ops = sock->ops;
 
-  /* ops->accept gained bool kern arg in 4.11 */
   retval = sock->ops->accept(sock, newsock, O_NONBLOCK, false);
   if (retval != 0) {
     sys_sock_close(new_syssock, 1);
@@ -310,12 +198,6 @@ static sock_t *sys_sock_accept(sock_t *sys_sock, void *priv, int *error,
 
   sock_activate(new_syssock);
 
-  /*
-   * ops->getname() dropped its int *addrlen pointer and now returns
-   * the length directly.  Red Hat backported this into their 4.18
-   * vendor kernel (the build kernel here is 4.18.0-*.el8.qtm).
-   * Use >= 4,17,0 as the cutoff to be safe.
-   */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
   retval =
       newsock->ops->getname(newsock, (struct sockaddr *)&new_syssock->saddr, 2);
@@ -361,11 +243,9 @@ static int sys_sock_bind(sock_t *sys_sock, uint32_t addr, uint16_t port) {
       sock->ops->bind(sock, (struct sockaddr *)&saddr_in, sizeof(saddr_in));
   if (retval < 0)
     return -1;
-
   retval = sock->ops->listen(sock, 1024);
   if (retval < 0)
     return -1;
-
   sock_activate(sys_sock);
   return 0;
 }
@@ -396,14 +276,13 @@ static int sys_sock_connect(sock_t *sys_sock, uint32_t addr,
                               sizeof(saddr_in), O_NONBLOCK);
   if (retval != 0 && retval != -EINPROGRESS)
     return -1;
-
   kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY, (void *)&disabled,
                     sizeof(disabled));
   return 0;
 }
 
 /* =========================================================
- * Debug helpers
+ * Debug / misc helpers
  * =========================================================*/
 
 static void debug_warn(char *fmt, ...) {
@@ -430,18 +309,12 @@ static void debug_check(void) {
 #endif
 }
 
-/* =========================================================
- * Tick / time helpers
- * =========================================================*/
-
 unsigned long __msecs_to_ticks(unsigned long msecs) {
   return msecs_to_jiffies(msecs);
 }
-
 unsigned long __ticks_to_msecs(unsigned long ticks) {
   return jiffies_to_msecs(ticks);
 }
-
 static uint32_t get_ticks(void) { return jiffies; }
 
 /* =========================================================
@@ -450,8 +323,7 @@ static uint32_t get_ticks(void) { return jiffies; }
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32))
 int bdev_unmap_support(iodev_t *iodev) {
-  struct request_queue *q = bdev_get_queue(iodev);
-  return blk_queue_discard(q) ? 1 : 0;
+  return blk_queue_discard(bdev_get_queue(iodev)) ? 1 : 0;
 }
 #else
 int bdev_unmap_support(iodev_t *iodev) { return 0; }
@@ -460,7 +332,6 @@ int bdev_unmap_support(iodev_t *iodev) { return 0; }
 iodev_t *open_block_device(const char *devpath, uint64_t *size,
                            uint32_t *sector_size, int *error) {
   iodev_t *b_dev;
-
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
   b_dev = blkdev_get_by_path(devpath, FMODE_READ | FMODE_WRITE, THIS_MODULE);
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 29))
@@ -474,7 +345,6 @@ iodev_t *open_block_device(const char *devpath, uint64_t *size,
     *error = -1;
     return NULL;
   }
-
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24))
   *sector_size = bdev_hardsect_size(b_dev);
 #else
@@ -502,7 +372,6 @@ static void close_block_device(iodev_t *b_dev) {
 
 static pagestruct_t *vm_pg_alloc(allocflags_t aflags) {
   int flags = GFP_NOIO | (aflags ? __GFP_ZERO : 0);
-
   if (aflags & Q_SFBUF)
     flags |= __GFP_HIGHMEM;
   return alloc_page(flags);
@@ -516,11 +385,10 @@ static void vm_pg_unref(pagestruct_t *pp) { put_page(pp); }
 void *vm_pg_map(pagestruct_t **pp, int pg_count) {
   return vmap(pp, pg_count, VM_MAP, PAGE_KERNEL);
 }
-
 void vm_pg_unmap(void *maddr, int pg_count) { vunmap(maddr); }
 
 /* =========================================================
- * Slab / alloc helpers
+ * Slab helpers
  * =========================================================*/
 
 static void *uma_zcreate(const char *name, size_t size) {
@@ -539,7 +407,6 @@ static void *uma_zalloc(uma_t *cachep, allocflags_t aflags, size_t len) {
   int flags = (aflags & Q_NOWAIT_INTR) ? GFP_ATOMIC : GFP_NOIO;
   int wait = (aflags & Q_WAITOK) ? 1 : 0;
   void *ret;
-
   while (!(ret = kmem_cache_alloc(cachep, flags)) && wait)
     msleep(1);
   if (ret && (aflags & Q_ZERO))
@@ -555,13 +422,11 @@ static void *__zalloc(size_t size, int type, allocflags_t aflags) {
   int flags = (aflags & Q_NOWAIT_INTR) ? GFP_ATOMIC : GFP_NOIO;
   int wait = (aflags & Q_WAITOK) ? 1 : 0;
   void *ret;
-
   while (!(ret = kzalloc(size, flags)) && wait)
     msleep(1);
   return ret;
 }
 
-/* kernel 4.18+ defines __malloc as a GCC attribute macro — undef first */
 #ifdef __malloc
 #undef __malloc
 #endif
@@ -569,13 +434,11 @@ static void *__malloc(size_t size, int type, allocflags_t aflags) {
   int flags = (aflags & Q_NOWAIT) ? GFP_ATOMIC : GFP_NOIO;
   int wait = (aflags & Q_WAITOK) ? 1 : 0;
   void *ret;
-
   while (!(ret = kmalloc(size, flags)) && wait)
     msleep(1);
   return ret;
 }
 
-/* kernel 5.9+ defines __free as a cleanup macro — undef first */
 #ifdef __free
 #undef __free
 #endif
@@ -594,13 +457,11 @@ uma_t *tpriv_cache;
 uma_t *bpriv_cache;
 
 /* =========================================================
- * Mutex / spinlock helpers
- * (use kernel names directly to avoid linuxdefs.h macro confusion)
+ * Lock helpers — use kernel names directly, no macros
  * =========================================================*/
 
 static mtx_t *mtx_alloc(const char *name) {
   mtx_t *mtx;
-
   while (!(mtx = kmem_cache_alloc(mtx_cache, GFP_NOIO)))
     msleep(1);
   spin_lock_init(mtx);
@@ -608,7 +469,6 @@ static mtx_t *mtx_alloc(const char *name) {
 }
 
 static void mtx_free(mtx_t *mtx) { kmem_cache_free(mtx_cache, mtx); }
-
 static void __mtx_lock(mtx_t *mtx) { spin_lock(mtx); }
 static void __mtx_unlock(mtx_t *mtx) { spin_unlock(mtx); }
 
@@ -622,13 +482,8 @@ static void __mtx_unlock_intr(mtx_t *mtx, void *data) {
   spin_unlock_irqrestore(mtx, *flags);
 }
 
-/* =========================================================
- * Shared mutex (sx) helpers — backed by struct mutex
- * =========================================================*/
-
 static sx_t *shx_alloc(const char *name) {
   sx_t *sx;
-
   while (!(sx = kmem_cache_alloc(sx_cache, GFP_NOIO)))
     msleep(1);
   mutex_init(sx);
@@ -643,12 +498,11 @@ static void shx_sunlock(sx_t *sx) { mutex_unlock(sx); }
 static int shx_xlocked(sx_t *sx) { return mutex_is_locked(sx); }
 
 /* =========================================================
- * Condition variable helpers — backed by wait_queue_head_t
+ * CV helpers
  * =========================================================*/
 
 static cv_t *cv_alloc(const char *name) {
   cv_t *cv;
-
   while (!(cv = kmem_cache_alloc(cv_cache, GFP_NOIO)))
     msleep(1);
   init_waitqueue_head(cv);
@@ -660,7 +514,6 @@ static void cv_free(cv_t *cv) { kmem_cache_free(cv_cache, cv); }
 static void cv_wait(cv_t *cv, mtx_t *mtx, void *data, int intr) {
   unsigned long *flags = data;
   DEFINE_WAIT(wait);
-
   add_wait_queue_exclusive(cv, &wait);
   set_current_state(intr ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
   spin_unlock_irqrestore(mtx, *flags);
@@ -674,7 +527,6 @@ static long cv_timedwait(cv_t *cv, mtx_t *mtx, void *data, int timo) {
   unsigned long *flags = data;
   DEFINE_WAIT(wait);
   long ret;
-
   add_wait_queue_exclusive(cv, &wait);
   set_current_state(TASK_INTERRUPTIBLE);
   spin_unlock_irqrestore(mtx, *flags);
@@ -685,13 +537,8 @@ static long cv_timedwait(cv_t *cv, mtx_t *mtx, void *data, int timo) {
   return ret;
 }
 
-/*
- * cv_wait_sig uses a plain spinlock (mtx_t), NOT a mutex.
- * Call spin_lock/unlock directly to avoid any macro confusion.
- */
 static void cv_wait_sig(cv_t *cv, mtx_t *mtx, int intr) {
   DEFINE_WAIT(wait);
-
   add_wait_queue_exclusive(cv, &wait);
   set_current_state(intr ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
   spin_unlock(mtx);
@@ -700,10 +547,6 @@ static void cv_wait_sig(cv_t *cv, mtx_t *mtx, int intr) {
   set_current_state(TASK_RUNNING);
   remove_wait_queue(cv, &wait);
 }
-
-/* =========================================================
- * Wakeup helpers
- * =========================================================*/
 
 static void wakeup(cv_t *cv, mtx_t *mtx) {
   unsigned long flags;
@@ -814,8 +657,7 @@ static int __kernel_thread_check(int *flags, int bit) {
 }
 
 static void sched_prio(int prio) {
-  int set_prio = (prio == QS_PRIO_SWP) ? -20 : -19;
-  set_user_nice(current, set_prio);
+  set_user_nice(current, (prio == QS_PRIO_SWP) ? -20 : -19);
 }
 
 static int __kernel_thread_stop(kproc_t *task, int *flags, void *chan,
@@ -832,22 +674,13 @@ static int get_cpu_count(void) { return num_online_cpus(); }
 struct bio_priv {
   void *priv;
   void (*end_bio_func)(bio_t *bio, int err);
-  /*
-   * bi_bdev was removed in some vendor RHEL8 4.18 builds.
-   * Store iodev here so send_bio / bio_get_iodev never touch bi_bdev.
-   */
-  iodev_t *iodev;
+  iodev_t *iodev; /* stored here; bi_bdev removed in some 4.18 vendor builds */
 };
 
-/*
- * bio->bi_end_io lost its 'int error' parameter in kernel 4.3.
- * On 4.3+ retrieve the error from blk_status_to_errno(bio->bi_status).
- */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 static void bio_end_bio(bio_t *bio) {
   struct bio_priv *bpriv = bio->bi_private;
-  int err = blk_status_to_errno(bio->bi_status);
-  (*bpriv->end_bio_func)(bio, err);
+  (*bpriv->end_bio_func)(bio, blk_status_to_errno(bio->bi_status));
 }
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24)
 static int bio_end_bio(bio_t *bio, uint32_t bytes_done, int err) {
@@ -894,9 +727,6 @@ void g_destroy_bio(bio_t *bio) {
   bio_put(bio);
 }
 
-/*
- * bio->bi_rw replaced by bio->bi_opf + REQ_OP_* in kernel 4.8.
- */
 static void bio_set_command(bio_t *bio, int cmd) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
   switch (cmd) {
@@ -963,14 +793,12 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
     return NULL;
   }
 
-  /* bi_sector moved into bi_iter in 3.14 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   bio->bi_iter.bi_sector = bi_sector;
 #else
   bio->bi_sector = bi_sector;
 #endif
 
-  /* bio_set_dev() available from 4.14; older kernels use bi_bdev directly */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
   bio_set_dev(bio, iodev);
 #else
@@ -979,17 +807,13 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
 
   bpriv->priv = consumer;
   bpriv->end_bio_func = end_bio_func;
-  bpriv->iodev = iodev; /* safe retrieval regardless of kernel ver */
+  bpriv->iodev = iodev;
   bio->bi_end_io = bio_end_bio;
   bio->bi_private = bpriv;
   bio_set_command(bio, rw);
   return bio;
 }
 
-/*
- * bio_free_pages() is exported by the kernel since ~4.13.
- * Rename ours to avoid the 'static declaration follows non-static' error.
- */
 static void qs_bio_free_pages(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   struct bio_vec bvec;
@@ -1006,8 +830,7 @@ static void bio_free_page(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   put_page(bio->bi_io_vec[0].bv_page);
 #else
-  struct bio_vec *bvec = bio_iovec_idx(bio, 0);
-  put_page(bvec->bv_page);
+  put_page(bio_iovec_idx(bio, 0)->bv_page);
 #endif
 }
 
@@ -1028,8 +851,7 @@ static int bio_get_length(bio_t *bio) {
 }
 
 static void *bio_get_caller(bio_t *bio) {
-  struct bio_priv *bpriv = bio->bi_private;
-  return bpriv->priv;
+  return ((struct bio_priv *)bio->bi_private)->priv;
 }
 
 static uint64_t bio_get_start_sector(bio_t *bio) {
@@ -1050,14 +872,8 @@ static uint32_t bio_get_max_pages(iodev_t *iodev) {
 
 static uint32_t bio_get_nr_sectors(bio_t *bio) { return bio_sectors(bio); }
 
-/*
- * bi_bdev removed in vendor RHEL8 4.18 and upstream 5.12.
- * Use bpriv->iodev stored at allocation time instead.
- * generic_make_request() renamed to submit_bio() in 5.9.
- */
 static iodev_t *send_bio(bio_t *bio) {
-  struct bio_priv *bpriv = bio->bi_private;
-  iodev_t *iodev = bpriv->iodev;
+  iodev_t *iodev = ((struct bio_priv *)bio->bi_private)->iodev;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
   submit_bio(bio);
 #else
@@ -1067,12 +883,11 @@ static iodev_t *send_bio(bio_t *bio) {
 }
 
 static iodev_t *bio_get_iodev(bio_t *bio) {
-  struct bio_priv *bpriv = bio->bi_private;
-  return bpriv->iodev;
+  return ((struct bio_priv *)bio->bi_private)->iodev;
 }
 
 /* =========================================================
- * Process helpers
+ * Thread helpers
  * =========================================================*/
 
 static void processor_yield(void) { yield(); }
@@ -1086,7 +901,6 @@ static int kproc_create(void *fn, void *data, kproc_t **task,
   va_start(args, namefmt);
   vsprintf(name, namefmt, args);
   va_end(args);
-
   tsk = kthread_run(fn, data, name);
   if (IS_ERR(tsk))
     return -1;
@@ -1142,41 +956,9 @@ static void thread_end(struct tpriv *tpriv) {
 #endif
 
 /* =========================================================
- * kcbs struct initializer
- *
- * linuxdefs.h defines macros that collide with field names:
- *   free, malloc, zalloc, printf, sprintf, snprintf,
- *   ticks_to_msecs, mtx_lock, mtx_unlock, copyin, copyout, pause
- *
- * We included linuxdefs.h earlier (needed for typedefs used in
- * function bodies above).  Now undef them all before the struct
- * literal so the compiler sees the real field names, then restore.
+ * kcbs struct — all field names are plain identifiers here
+ * because linuxdefs.h no longer defines the colliding macros
  * =========================================================*/
-#pragma push_macro("free")
-#pragma push_macro("malloc")
-#pragma push_macro("zalloc")
-#pragma push_macro("printf")
-#pragma push_macro("sprintf")
-#pragma push_macro("snprintf")
-#pragma push_macro("ticks_to_msecs")
-#pragma push_macro("mtx_lock")
-#pragma push_macro("mtx_unlock")
-#pragma push_macro("copyin")
-#pragma push_macro("copyout")
-#pragma push_macro("pause")
-
-#undef free
-#undef malloc
-#undef zalloc
-#undef printf
-#undef sprintf
-#undef snprintf
-#undef ticks_to_msecs
-#undef mtx_lock
-#undef mtx_unlock
-#undef copyin
-#undef copyout
-#undef pause
 
 static struct qs_kern_cbs kcbs = {
     .debug_warn = debug_warn,
@@ -1276,21 +1058,8 @@ static struct qs_kern_cbs kcbs = {
     .sock_nopush = sys_sock_nopush,
 };
 
-#pragma pop_macro("pause")
-#pragma pop_macro("copyout")
-#pragma pop_macro("copyin")
-#pragma pop_macro("mtx_unlock")
-#pragma pop_macro("mtx_lock")
-#pragma pop_macro("ticks_to_msecs")
-#pragma pop_macro("snprintf")
-#pragma pop_macro("sprintf")
-#pragma pop_macro("printf")
-#pragma pop_macro("zalloc")
-#pragma pop_macro("malloc")
-#pragma pop_macro("free")
-
 /* =========================================================
- * Socket callbacks — defined after kcbs so they can call into it
+ * Socket callbacks
  * =========================================================*/
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)
@@ -1318,14 +1087,8 @@ static void sys_sock_state_change(struct sock *sk) {
   int newstate;
   if (!sys_sock)
     return;
-  switch (sk->sk_state) {
-  case TCP_ESTABLISHED:
-    newstate = SOCK_STATE_CONNECTED;
-    break;
-  default:
-    newstate = SOCK_STATE_CLOSED;
-    break;
-  }
+  newstate = (sk->sk_state == TCP_ESTABLISHED) ? SOCK_STATE_CONNECTED
+                                               : SOCK_STATE_CLOSED;
   (*kcbs.sock_state_change)(sys_sock->priv, newstate);
 }
 
@@ -1337,8 +1100,7 @@ static struct mutex ioctl_lock;
 
 static int coremod_open(vnode_t *i, struct file *f) { return 0; }
 static int coremod_release(vnode_t *i, struct file *f) { return 0; }
-
-static ssize_t coremod_read(struct file *file, char __user *buf, size_t count,
+static ssize_t coremod_read(struct file *f, char __user *buf, size_t count,
                             loff_t *ppos) {
   return count;
 }
@@ -1352,8 +1114,7 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
 #endif
 {
   void __user *userp = (void __user *)arg;
-  int err = 0;
-  int retval = 0;
+  int err = 0, retval = 0;
   struct bdev_info *bdev_info;
   struct mdaemon_info mdaemon_info;
   struct group_conf *group_conf;
@@ -1386,22 +1147,19 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
   mutex_lock(&ioctl_lock);
   switch (cmd) {
   case TLTARGIOCDAEMONSETINFO:
-    if ((retval = copy_from_user(&mdaemon_info, userp, sizeof(mdaemon_info))) !=
-        0)
+    if ((retval = copy_from_user(&mdaemon_info, userp, sizeof(mdaemon_info))))
       break;
     (*kcbs.mdaemon_set_info)(&mdaemon_info);
     break;
-
   case TLTARGIOCADDFCRULE:
   case TLTARGIOCREMOVEFCRULE:
-    if ((retval = copy_from_user(&fc_rule_config, userp,
-                                 sizeof(fc_rule_config))) != 0)
+    if ((retval =
+             copy_from_user(&fc_rule_config, userp, sizeof(fc_rule_config))))
       break;
     retval = (cmd == TLTARGIOCADDFCRULE)
                  ? (*kcbs.target_add_fc_rule)(&fc_rule_config)
                  : (*kcbs.target_remove_fc_rule)(&fc_rule_config);
     break;
-
   case TLTARGIOCNEWBLKDEV:
   case TLTARGIOCDELBLKDEV:
   case TLTARGIOCGETBLKDEV:
@@ -1411,7 +1169,7 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       retval = -ENOMEM;
       break;
     }
-    if ((retval = copy_from_user(bdev_info, userp, sizeof(*bdev_info))) != 0) {
+    if ((retval = copy_from_user(bdev_info, userp, sizeof(*bdev_info)))) {
       kfree(bdev_info);
       break;
     }
@@ -1429,7 +1187,6 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       err = copy_to_user(userp, bdev_info, sizeof(*bdev_info));
     kfree(bdev_info);
     break;
-
   case TLTARGIOCNEWDEVICE:
   case TLTARGIOCDELETEDEVICE:
   case TLTARGIOCMODDEVICE:
@@ -1441,8 +1198,7 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       retval = -ENOMEM;
       break;
     }
-    if ((retval = copy_from_user(deviceinfo, userp, sizeof(*deviceinfo))) !=
-        0) {
+    if ((retval = copy_from_user(deviceinfo, userp, sizeof(*deviceinfo)))) {
       kfree(deviceinfo);
       break;
     }
@@ -1464,7 +1220,6 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       err = copy_to_user(userp, deviceinfo, sizeof(*deviceinfo));
     kfree(deviceinfo);
     break;
-
   case TLTARGIOCNEWVCARTRIDGE:
   case TLTARGIOCLOADVCARTRIDGE:
   case TLTARGIOCDELETEVCARTRIDGE:
@@ -1475,8 +1230,7 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       retval = -ENOMEM;
       break;
     }
-    if ((retval = copy_from_user(vcartridge, userp, sizeof(*vcartridge))) !=
-        0) {
+    if ((retval = copy_from_user(vcartridge, userp, sizeof(*vcartridge)))) {
       kfree(vcartridge);
       break;
     }
@@ -1496,7 +1250,6 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       err = copy_to_user(userp, vcartridge, sizeof(*vcartridge));
     kfree(vcartridge);
     break;
-
   case TLTARGIOCCHECKDISKS:
     retval = (*kcbs.coremod_check_disks)();
     break;
@@ -1509,7 +1262,6 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
   case TLTARGIOCUNLOAD:
     retval = (*kcbs.coremod_exit)();
     break;
-
   case TLTARGIOCADDGROUP:
   case TLTARGIOCDELETEGROUP:
   case TLTARGIOCRENAMEGROUP:
@@ -1518,8 +1270,7 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       retval = -ENOMEM;
       break;
     }
-    if ((retval = copy_from_user(group_conf, userp, sizeof(*group_conf))) !=
-        0) {
+    if ((retval = copy_from_user(group_conf, userp, sizeof(*group_conf)))) {
       kfree(group_conf);
       break;
     }
@@ -1531,7 +1282,6 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       retval = (*kcbs.bdev_rename_group)(group_conf);
     kfree(group_conf);
     break;
-
   default:
     break;
   }
@@ -1578,32 +1328,27 @@ static int init_caches(void) {
       kmem_cache_create("vt_bpriv_cache", sizeof(struct bio_priv), 0, 0, NULL);
   if (unlikely(!bpriv_cache))
     return -1;
-
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
   tpriv_cache =
       kmem_cache_create("vt_tpriv_cache", sizeof(struct blk_plug), 0, 0, NULL);
   if (unlikely(!tpriv_cache))
     return -1;
 #endif
-
   mtx_size = max_t(int, sizeof(mtx_t), sizeof(void *));
   mtx_cache = kmem_cache_create("vt_mtx_cache", mtx_size, 0, 0, NULL);
   if (unlikely(!mtx_cache))
     return -1;
-
   sx_cache = kmem_cache_create("vt_sx_cache", sizeof(sx_t), 0, 0, NULL);
   if (unlikely(!sx_cache))
     return -1;
-
   cv_cache = kmem_cache_create("vt_cv_cache", sizeof(cv_t), 0, 0, NULL);
   if (unlikely(!cv_cache))
     return -1;
-
   return 0;
 }
 
 /* =========================================================
- * Module interface
+ * Module interface / init / exit
  * =========================================================*/
 
 #define coremod THIS_MODULE
@@ -1619,8 +1364,7 @@ int vtdevice_register_interface(struct qs_interface_cbs *icbs) {
 }
 
 void vtdevice_unregister_interface(struct qs_interface_cbs *icbs) {
-  int retval = __device_unregister_interface(icbs);
-  if (retval == 0)
+  if (__device_unregister_interface(icbs) == 0)
     module_release(coremod);
 }
 
