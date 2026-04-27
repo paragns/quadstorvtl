@@ -26,9 +26,10 @@
 
 /* Socket related stuff */
 
-/* FIX #1: sk_data_ready callback lost the 'int count' parameter in kernel 3.15+
- * Old: void sys_sock_data_ready(struct sock *sk, int count)
- * New: void sys_sock_data_ready(struct sock *sk)
+/*
+ * FIX #1: sk_data_ready lost its 'int count' param in kernel 3.15.
+ * Forward-declare with the right signature so sock_activate()'s
+ * assignment compiles without an incompatible-pointer-types error.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)
 static void sys_sock_data_ready(struct sock *sk);
@@ -44,7 +45,6 @@ static int sys_sock_has_read_data(sock_t *sys_sock) {
 
   retval = sys_sock->sock->ops->ioctl(sys_sock->sock, SIOCINQ,
                                       (unsigned long)&avail);
-
   return (retval >= 0) ? avail : 0;
 }
 
@@ -60,7 +60,6 @@ static int sys_sock_read(sock_t *sys_sock, void *buf, int len) {
 
   iov.iov_base = buf;
   iov.iov_len = len;
-
   memset(&msg, 0, sizeof(msg));
   msg.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL;
   retval = kernel_recvmsg(sys_sock->sock, &msg, &iov, 1, len,
@@ -82,23 +81,18 @@ static void sock_deactivate(sock_t *sys_sock) {
   struct socket *sock = sys_sock->sock;
 
   write_lock_bh(&sock->sk->sk_callback_lock);
-
-  /* Restore callbacks */
   if (sys_sock->state_change) {
     sock->sk->sk_state_change = sys_sock->state_change;
     sys_sock->state_change = NULL;
   }
-
   if (sys_sock->data_ready) {
     sock->sk->sk_data_ready = sys_sock->data_ready;
     sys_sock->data_ready = NULL;
   }
-
   if (sys_sock->write_space) {
     sock->sk->sk_write_space = sys_sock->write_space;
     sys_sock->write_space = NULL;
   }
-
   sock->sk->sk_user_data = NULL;
   write_unlock_bh(&sock->sk->sk_callback_lock);
 }
@@ -109,7 +103,6 @@ static void sys_sock_close(sock_t *sys_sock, int linger) {
   if (!linger)
     kernel_setsockopt(sock, SOL_SOCKET, SO_LINGER, (void *)&linger,
                       sizeof(linger));
-
   sock_deactivate(sys_sock);
   if (sock->ops->shutdown)
     sock->ops->shutdown(sock, SEND_SHUTDOWN | RCV_SHUTDOWN);
@@ -139,7 +132,6 @@ static int sys_sock_write(sock_t *sys_sock, void *buf, int len) {
 
   iov.iov_base = buf;
   iov.iov_len = len;
-
   memset(&msg, 0, sizeof(msg));
   msg.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL;
   retval = kernel_sendmsg(sys_sock->sock, &msg, &iov, 1, len);
@@ -159,6 +151,10 @@ static sock_t *sys_sock_create(void *priv) {
   if (unlikely(!sys_sock))
     return NULL;
 
+  /*
+   * FIX #2: sock_create_kern() gained a 'struct net *' first argument
+   * in kernel 4.2.
+   */
   retval = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
                             &sys_sock->sock);
   if (unlikely(retval < 0)) {
@@ -175,13 +171,9 @@ static void sock_activate(sock_t *sys_sock) {
   write_lock_bh(&sock->sk->sk_callback_lock);
   sock->sk->sk_user_data = sys_sock;
   sock->sk->sk_allocation = GFP_NOFS;
-
-  /* Save callbacks */
   sys_sock->state_change = sock->sk->sk_state_change;
   sys_sock->data_ready = sock->sk->sk_data_ready;
   sys_sock->write_space = sock->sk->sk_write_space;
-
-  /* Set new callbacks */
   sock->sk->sk_state_change = sys_sock_state_change;
   sock->sk->sk_data_ready = sys_sock_data_ready;
   sock->sk->sk_write_space = sys_sock_write_space;
@@ -207,6 +199,10 @@ static sock_t *sys_sock_accept(sock_t *sys_sock, void *priv, int *error,
   newsock->type = sock->type;
   newsock->ops = sock->ops;
 
+  /*
+   * FIX #3: ops->accept() gained a 'bool kern' final argument in
+   * kernel 4.11.
+   */
   retval = sock->ops->accept(sock, newsock, O_NONBLOCK, false);
   if (retval != 0) {
     sys_sock_close(new_syssock, 1);
@@ -216,13 +212,12 @@ static sock_t *sys_sock_accept(sock_t *sys_sock, void *priv, int *error,
 
   sock_activate(new_syssock);
 
-  /* FIX #2: getname() signature changed in kernel 5.1 — it now returns the
-   * address length directly instead of writing it through a pointer parameter.
-   * Old: int getname(sock, addr, addrlen_ptr, peer)  -> returns 0 on success
-   * New: int getname(sock, addr, peer)               -> returns addrlen on
-   * success
+  /*
+   * FIX #4: ops->getname() dropped its addrlen pointer and now returns
+   * the length directly.  This was backported into the RHEL8 4.18
+   * vendor kernel, so use >= 4,17,0 as the practical cutoff.
    */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
   retval =
       newsock->ops->getname(newsock, (struct sockaddr *)&new_syssock->saddr, 2);
   if (retval < 0) {
@@ -267,11 +262,9 @@ static int sys_sock_bind(sock_t *sys_sock, uint32_t addr, uint16_t port) {
       sock->ops->bind(sock, (struct sockaddr *)&saddr_in, sizeof(saddr_in));
   if (retval < 0)
     return -1;
-
   retval = sock->ops->listen(sock, 1024);
   if (retval < 0)
     return -1;
-
   sock_activate(sys_sock);
   return 0;
 }
@@ -289,7 +282,6 @@ static int sys_sock_connect(sock_t *sys_sock, uint32_t addr,
   memset(&saddr_in, 0, sizeof(saddr_in));
   saddr_in.sin_family = AF_INET;
   saddr_in.sin_addr.s_addr = local_addr;
-
   retval =
       sock->ops->bind(sock, (struct sockaddr *)&saddr_in, sizeof(saddr_in));
   if (retval < 0)
@@ -305,7 +297,6 @@ skip_bind:
                               sizeof(saddr_in), O_NONBLOCK);
   if (retval != 0 && retval != -EINPROGRESS)
     return -1;
-
   kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY, (void *)&disabled,
                     sizeof(disabled));
   return 0;
@@ -313,7 +304,6 @@ skip_bind:
 
 static void debug_warn(char *fmt, ...) {
   va_list args;
-
   va_start(args, fmt);
   vprintk(fmt, args);
   va_end(args);
@@ -321,7 +311,6 @@ static void debug_warn(char *fmt, ...) {
 
 static void debug_print(char *fmt, ...) {
   va_list args;
-
   va_start(args, fmt);
   vprintk(fmt, args);
   va_end(args);
@@ -350,11 +339,7 @@ static uint32_t get_ticks(void) { return jiffies; }
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 32))
 int bdev_unmap_support(iodev_t *iodev) {
   struct request_queue *q = bdev_get_queue(iodev);
-
-  if (blk_queue_discard(q))
-    return 1;
-  else
-    return 0;
+  return blk_queue_discard(q) ? 1 : 0;
 }
 #else
 int bdev_unmap_support(iodev_t *iodev) { return 0; }
@@ -377,7 +362,6 @@ iodev_t *open_block_device(const char *devpath, uint64_t *size,
     *error = -1;
     return NULL;
   }
-
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24))
   *sector_size = bdev_hardsect_size(b_dev);
 #else
@@ -388,43 +372,28 @@ iodev_t *open_block_device(const char *devpath, uint64_t *size,
 }
 
 static void close_block_device(iodev_t *b_dev) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 29))
-  int flags = FMODE_READ | FMODE_WRITE;
-#endif
-
   if (!b_dev)
     return;
-
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
-  blkdev_put(b_dev, flags);
+  blkdev_put(b_dev, FMODE_READ | FMODE_WRITE);
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 29))
-  close_bdev_exclusive(b_dev, flags);
+  close_bdev_exclusive(b_dev, FMODE_READ | FMODE_WRITE);
 #else
   close_bdev_excl(b_dev);
 #endif
 }
 
-/*
- *Note corelib doesn't not understand GFP_* flags. flags > 1 means zeroed page
- */
 static pagestruct_t *vm_pg_alloc(allocflags_t aflags) {
-  pagestruct_t *pp;
   int flags = GFP_NOIO | (aflags ? __GFP_ZERO : 0);
 
   if (aflags & Q_SFBUF)
     aflags |= __GFP_HIGHMEM;
-  pp = alloc_page(flags);
-  return pp;
+  return alloc_page(flags);
 }
 
 static void vm_pg_free(pagestruct_t *pp) { __free_page(pp); }
-
-static void *vm_pg_address(pagestruct_t *pp) {
-  return (void *)(page_address(pp));
-}
-
+static void *vm_pg_address(pagestruct_t *pp) { return page_address(pp); }
 static void vm_pg_ref(pagestruct_t *pp) { get_page(pp); }
-
 static void vm_pg_unref(pagestruct_t *pp) { put_page(pp); }
 
 void *vm_pg_map(pagestruct_t **pp, int pg_count) {
@@ -434,18 +403,15 @@ void *vm_pg_map(pagestruct_t **pp, int pg_count) {
 void vm_pg_unmap(void *maddr, int pg_count) { vunmap(maddr); }
 
 static void *uma_zcreate(const char *name, size_t size) {
-  void *cachep;
-
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 23))
-  cachep = slab_cache_create(name, size, 0, 0, NULL, NULL);
+  return kmem_cache_create(name, size, 0, 0, NULL, NULL);
 #else
-  cachep = slab_cache_create(name, size, 0, 0, NULL);
+  return kmem_cache_create(name, size, 0, 0, NULL);
 #endif
-  return cachep;
 }
 
 static void uma_zdestroy(const char *name, void *cachep) {
-  slab_cache_destroy(cachep);
+  kmem_cache_destroy(cachep);
 }
 
 static void *uma_zalloc(uma_t *cachep, allocflags_t aflags, size_t len) {
@@ -455,7 +421,6 @@ static void *uma_zalloc(uma_t *cachep, allocflags_t aflags, size_t len) {
 
   while (!(ret = kmem_cache_alloc(cachep, flags)) && wait)
     msleep(1);
-
   if (ret && (aflags & Q_ZERO))
     memset(ret, 0, len);
   return ret;
@@ -475,10 +440,9 @@ static void *__zalloc(size_t size, int type, allocflags_t aflags) {
   return ret;
 }
 
-/* FIX #3: kernel 4.18+ defines __malloc as a GCC attribute macro via
- * include/linux/compiler_attributes.h. Undefine it before declaring our
- * local static function of the same name to avoid the macro expansion
- * mangling the function declaration.
+/*
+ * FIX #5: kernel 4.18+ defines __malloc as a GCC attribute macro —
+ * undef before our local function of the same name.
  */
 #ifdef __malloc
 #undef __malloc
@@ -493,10 +457,9 @@ static void *__malloc(size_t size, int type, allocflags_t aflags) {
   return ret;
 }
 
-/* FIX #4: kernel 5.9+ introduces a __free() cleanup macro via
- * include/linux/cleanup.h.  Undefine it before declaring our local
- * static wrapper so the compiler sees a plain function, not a macro
- * expansion that produces garbage at file scope.
+/*
+ * FIX #6: kernel 5.9+ defines __free as a cleanup macro —
+ * undef before our local wrapper.
  */
 #ifdef __free
 #undef __free
@@ -516,25 +479,28 @@ static mtx_t *mtx_alloc(const char *name) {
 
   while (!(mtx = kmem_cache_alloc(mtx_cache, GFP_NOIO)))
     msleep(1);
-
   spin_lock_init(mtx);
   return mtx;
 }
 
 static void mtx_free(mtx_t *mtx) { kmem_cache_free(mtx_cache, mtx); }
 
-static void __mtx_lock(mtx_t *mtx) { mtx_lock(mtx); }
+/* Use plain kernel primitives here — the linuxdefs.h macros are still
+ * active at this point so we call spin_*/
+    mutex_ *directly to avoid *any macro confusion inside function bodies.* /
+    static void __mtx_lock(mtx_t *mtx) {
+  spin_lock(mtx);
+}
+static void __mtx_unlock(mtx_t *mtx) { spin_unlock(mtx); }
 
 static void __mtx_lock_intr(mtx_t *mtx, void *data) {
   unsigned long *flags = data;
-  mtx_lock_irqsave(mtx, *flags);
+  spin_lock_irqsave(mtx, *flags);
 }
-
-static void __mtx_unlock(mtx_t *mtx) { mtx_unlock(mtx); }
 
 static void __mtx_unlock_intr(mtx_t *mtx, void *data) {
   unsigned long *flags = data;
-  mtx_unlock_irqrestore(mtx, *flags);
+  spin_unlock_irqrestore(mtx, *flags);
 }
 
 static sx_t *shx_alloc(const char *name) {
@@ -542,21 +508,15 @@ static sx_t *shx_alloc(const char *name) {
 
   while (!(sx = kmem_cache_alloc(sx_cache, GFP_NOIO)))
     msleep(1);
-
   mutex_init(sx);
   return sx;
 }
 
 static void shx_free(sx_t *sx) { kmem_cache_free(sx_cache, sx); }
-
 static void shx_xlock(sx_t *sx) { mutex_lock(sx); }
-
 static void shx_xunlock(sx_t *sx) { mutex_unlock(sx); }
-
 static void shx_slock(sx_t *sx) { mutex_lock(sx); }
-
 static void shx_sunlock(sx_t *sx) { mutex_unlock(sx); }
-
 static int shx_xlocked(sx_t *sx) { return mutex_is_locked(sx); }
 
 static cv_t *cv_alloc(const char *name) {
@@ -564,7 +524,6 @@ static cv_t *cv_alloc(const char *name) {
 
   while (!(cv = kmem_cache_alloc(cv_cache, GFP_NOIO)))
     msleep(1);
-
   init_waitqueue_head(cv);
   return cv;
 }
@@ -576,13 +535,10 @@ static void cv_wait(cv_t *cv, mtx_t *mtx, void *data, int intr) {
   DEFINE_WAIT(wait);
 
   add_wait_queue_exclusive(cv, &wait);
-  if (!intr)
-    set_current_state(TASK_UNINTERRUPTIBLE);
-  else
-    set_current_state(TASK_INTERRUPTIBLE);
-  mtx_unlock_irqrestore(mtx, *flags);
+  set_current_state(intr ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
+  spin_unlock_irqrestore(mtx, *flags);
   schedule();
-  mtx_lock_irqsave(mtx, *flags);
+  spin_lock_irqsave(mtx, *flags);
   set_current_state(TASK_RUNNING);
   remove_wait_queue(cv, &wait);
 }
@@ -594,9 +550,9 @@ static long cv_timedwait(cv_t *cv, mtx_t *mtx, void *data, int timo) {
 
   add_wait_queue_exclusive(cv, &wait);
   set_current_state(TASK_INTERRUPTIBLE);
-  mtx_unlock_irqrestore(mtx, *flags);
+  spin_unlock_irqrestore(mtx, *flags);
   ret = schedule_timeout(msecs_to_jiffies(timo));
-  mtx_lock_irqsave(mtx, *flags);
+  spin_lock_irqsave(mtx, *flags);
   set_current_state(TASK_RUNNING);
   remove_wait_queue(cv, &wait);
   return ret;
@@ -606,70 +562,61 @@ static void cv_wait_sig(cv_t *cv, mtx_t *mtx, int intr) {
   DEFINE_WAIT(wait);
 
   add_wait_queue_exclusive(cv, &wait);
-  if (!intr)
-    set_current_state(TASK_UNINTERRUPTIBLE);
-  else
-    set_current_state(TASK_INTERRUPTIBLE);
-  mtx_unlock(mtx);
+  set_current_state(intr ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
+  mutex_unlock(mtx);
   schedule();
-  mtx_lock(mtx);
+  mutex_lock(mtx);
   set_current_state(TASK_RUNNING);
   remove_wait_queue(cv, &wait);
 }
 
 static void wakeup(cv_t *cv, mtx_t *mtx) {
   unsigned long flags;
-
-  mtx_lock_irqsave(mtx, flags);
+  spin_lock_irqsave(mtx, flags);
   wake_up_all(cv);
-  mtx_unlock_irqrestore(mtx, flags);
+  spin_unlock_irqrestore(mtx, flags);
 }
 
 static void wakeup_nointr(cv_t *cv, mtx_t *mtx) {
-  mtx_lock(mtx);
+  spin_lock(mtx);
   wake_up_all(cv);
-  mtx_unlock(mtx);
+  spin_unlock(mtx);
 }
 
 static void wakeup_compl(cv_t *cv, mtx_t *mtx, int *done) {
   unsigned long flags;
-
-  mtx_lock_irqsave(mtx, flags);
+  spin_lock_irqsave(mtx, flags);
   *done = 1;
   wake_up_all(cv);
-  mtx_unlock_irqrestore(mtx, flags);
+  spin_unlock_irqrestore(mtx, flags);
 }
 
 static void wakeup_one(cv_t *cv, mtx_t *mtx) {
   unsigned long flags;
-
-  mtx_lock_irqsave(mtx, flags);
+  spin_lock_irqsave(mtx, flags);
   wake_up(cv);
-  mtx_unlock_irqrestore(mtx, flags);
+  spin_unlock_irqrestore(mtx, flags);
 }
 
 static void wakeup_one_nointr(cv_t *cv, mtx_t *mtx) {
-  mtx_lock(mtx);
+  spin_lock(mtx);
   wake_up(cv);
-  mtx_unlock(mtx);
+  spin_unlock(mtx);
 }
 
 static void wakeup_one_compl(cv_t *cv, mtx_t *mtx, int *done) {
   unsigned long flags;
-
-  mtx_lock_irqsave(mtx, flags);
+  spin_lock_irqsave(mtx, flags);
   *done = 1;
   wake_up(cv);
-  mtx_unlock_irqrestore(mtx, flags);
+  spin_unlock_irqrestore(mtx, flags);
 }
 
 static void wakeup_one_unlocked(cv_t *cv) { wake_up(cv); }
-
 static void wakeup_unlocked(cv_t *cv) { wake_up_all(cv); }
 
 static uint64_t get_availmem(void) {
   struct sysinfo si;
-
   si_meminfo(&si);
   return (si.totalram * si.mem_unit);
 }
@@ -691,7 +638,6 @@ static void bdev_start(iodev_t *b_dev, struct tpriv *tpriv) {
   }
 #else
   struct request_queue *bdev_q = bdev_get_queue(b_dev);
-
   if (bdev_q && bdev_q->unplug_fn)
     bdev_q->unplug_fn(bdev_q);
 #endif
@@ -701,7 +647,6 @@ static void __pause(const char *msg, int timo) { msleep(timo); }
 
 static void __qs_printf(const char *fmt, ...) {
   va_list args;
-
   va_start(args, fmt);
   vprintk(fmt, args);
   va_end(args);
@@ -710,7 +655,6 @@ static void __qs_printf(const char *fmt, ...) {
 static int __sprintf(char *buf, const char *fmt, ...) {
   va_list args;
   int ret;
-
   va_start(args, fmt);
   ret = vsprintf(buf, fmt, args);
   va_end(args);
@@ -720,7 +664,6 @@ static int __sprintf(char *buf, const char *fmt, ...) {
 static int __snprintf(char *buf, size_t size, const char *fmt, ...) {
   va_list args;
   int ret;
-
   va_start(args, fmt);
   ret = vsnprintf(buf, size, fmt, args);
   va_end(args);
@@ -732,8 +675,7 @@ static int __kernel_thread_check(int *flags, int bit) {
 }
 
 static void sched_prio(int prio) {
-  int set_prio = -15;
-
+  int set_prio;
   switch (prio) {
   case QS_PRIO_SWP:
     set_prio = -20;
@@ -743,6 +685,7 @@ static void sched_prio(int prio) {
     break;
   default:
     DEBUG_BUG_ON(1);
+    return;
   }
   set_user_nice(current, set_prio);
 }
@@ -754,39 +697,40 @@ static int __kernel_thread_stop(kproc_t *task, int *flags, void *chan,
 
 static int get_cpu_count(void) { return num_online_cpus(); }
 
+/*
+ * bio_priv: private payload attached to every bio we allocate.
+ *
+ * FIX #7: bi_bdev was removed in some RHEL8 4.18 vendor builds and in
+ * upstream 5.12.  Cache the iodev here so send_bio() and bio_get_iodev()
+ * never need to touch bi_bdev at all.
+ */
 struct bio_priv {
   void *priv;
   void (*end_bio_func)(bio_t *bio, int err);
+  iodev_t *iodev;
 };
 
 /*
- * FIX #5: bio->bi_end_io callback lost the 'int error' parameter in kernel
- * 4.3. On 4.3+ the error is retrieved via blk_status_to_errno(bio->bi_status).
- *
- * Old (< 4.3): void bio_end_bio(struct bio *bio, int err)
- * New (>= 4.3): void bio_end_bio(struct bio *bio)
+ * FIX #8: bio->bi_end_io callback dropped its 'int error' parameter in
+ * kernel 4.3.  On >= 4.3 retrieve the error from bio->bi_status.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
 static void bio_end_bio(bio_t *bio) {
-  struct bio_priv *bpriv = (struct bio_priv *)(bio->bi_private);
+  struct bio_priv *bpriv = bio->bi_private;
   int err = blk_status_to_errno(bio->bi_status);
-
   (*bpriv->end_bio_func)(bio, err);
 }
-#elif (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24))
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24)
 static int bio_end_bio(bio_t *bio, uint32_t bytes_done, int err) {
-  struct bio_priv *bpriv = (struct bio_priv *)(bio->bi_private);
-
+  struct bio_priv *bpriv = bio->bi_private;
   if (bio->bi_size)
     return 1;
-
   (*bpriv->end_bio_func)(bio, err);
   return 0;
 }
 #else
 static void bio_end_bio(bio_t *bio, int err) {
-  struct bio_priv *bpriv = (struct bio_priv *)(bio->bi_private);
-
+  struct bio_priv *bpriv = bio->bi_private;
   (*bpriv->end_bio_func)(bio, err);
 }
 #endif
@@ -801,17 +745,13 @@ int bio_unmap(iodev_t *iodev, void *cp, uint64_t start_sector, uint32_t blocks,
     start_sector <<= diff;
     blocks <<= diff;
   }
-
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35)
   err = blkdev_issue_discard(iodev, start_sector, blocks, GFP_NOIO,
                              DISCARD_FL_WAIT);
 #else
   err = blkdev_issue_discard(iodev, start_sector, blocks, GFP_NOIO, 0);
 #endif
-  if (err)
-    return -1;
-  else
-    return 1;
+  return err ? -1 : 1;
 }
 #else
 int bio_unmap(iodev_t *iodev, void *cp, uint64_t start_sector, uint32_t blocks,
@@ -825,9 +765,8 @@ void g_destroy_bio(bio_t *bio) {
   bio_put(bio);
 }
 
-/* FIX #6: bio->bi_rw was replaced by bio->bi_opf in kernel 4.8, and the
- * old READ/WRITE/WRITE_FUA/WRITE_FLUSH_FUA constants were replaced by
- * REQ_OP_* plus REQ_FUA / REQ_PREFLUSH flag bits.
+/*
+ * FIX #9: bio->bi_rw replaced by bio->bi_opf in kernel 4.8.
  */
 static void bio_set_command(bio_t *bio, int cmd) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
@@ -879,13 +818,6 @@ static void bio_set_command(bio_t *bio, int cmd) {
 #endif
 }
 
-/* FIX #7: bio->bi_sector and bio->bi_bdev were folded into bi_iter in
- * kernel 3.14. Use bio_set_dev() helper (available since 4.14) for
- * bi_bdev; fall back to direct assignment on older kernels.
- * Store iodev in bi_private's companion field via the bpriv struct, and
- * also keep it in bi_bdev / bi_disk depending on kernel version so that
- * send_bio / bio_get_iodev can retrieve it uniformly.
- */
 bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
                  void *consumer, uint64_t bi_sector, int bio_vec_count,
                  int rw) {
@@ -902,18 +834,18 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
     return NULL;
   }
 
+  /* FIX #10: bi_sector moved into bi_iter in kernel 3.14 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   bio->bi_iter.bi_sector = bi_sector;
 #else
   bio->bi_sector = bi_sector;
 #endif
 
-/* FIX #7b: bio->bi_bdev removed in kernel 5.12; use bio_set_dev() from 4.14+.
- * For kernels 3.14–4.13 assign bi_bdev directly.
- * For older kernels use bi_bdev directly too.
- * We also store iodev in bi_private so send_bio/bio_get_iodev can find it
- * on all kernel versions without touching bi_bdev at all post-5.12.
- */
+  /*
+   * FIX #7b: bio_set_dev() available from 4.14, handles bi_bdev /
+   * bi_disk correctly.  We also stash iodev in bpriv so retrieval
+   * never depends on bi_bdev being present.
+   */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
   bio_set_dev(bio, iodev);
 #else
@@ -922,27 +854,26 @@ bio_t *g_new_bio(iodev_t *iodev, void (*end_bio_func)(bio_t *, int),
 
   bpriv->priv = consumer;
   bpriv->end_bio_func = end_bio_func;
+  bpriv->iodev = iodev;
   bio->bi_end_io = bio_end_bio;
-  bio->bi_private = bpriv;
-  /* Store iodev so we can recover it in send_bio/bio_get_iodev */
   bio->bi_private = bpriv;
   bio_set_command(bio, rw);
   return bio;
 }
 
-/* FIX #8: bio_free_pages() is exported by the kernel since ~4.13.
- * Rename our local version to avoid the 'static declaration follows
- * non-static declaration' error.
+/*
+ * FIX #11: bio_free_pages() is exported by the kernel from ~4.13.
+ * Rename ours to qs_bio_free_pages to avoid the symbol clash.
  */
 static void qs_bio_free_pages(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   struct bio_vec bvec;
   struct bvec_iter j;
-  bio_for_each_segment(bvec, bio, j) { put_page(bvec.bv_page); }
+  bio_for_each_segment(bvec, bio, j) put_page(bvec.bv_page);
 #else
   struct bio_vec *bvec;
   int j;
-  bio_for_each_segment(bvec, bio, j) { put_page(bvec->bv_page); }
+  bio_for_each_segment(bvec, bio, j) put_page(bvec->bv_page);
 #endif
 }
 
@@ -950,21 +881,17 @@ static void bio_free_page(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
   put_page(bio->bi_io_vec[0].bv_page);
 #else
-  struct bio_vec *bvec;
-  bvec = bio_iovec_idx(bio, 0);
+  struct bio_vec *bvec = bio_iovec_idx(bio, 0);
   put_page(bvec->bv_page);
 #endif
 }
 
 static int bio_get_command(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
-  if (bio_op(bio) == REQ_OP_READ)
+  return (bio_op(bio) == REQ_OP_READ) ? QS_IO_READ : QS_IO_WRITE;
 #else
-  if (bio->bi_rw == READ)
+  return (bio->bi_rw == READ) ? QS_IO_READ : QS_IO_WRITE;
 #endif
-    return QS_IO_READ;
-  else
-    return QS_IO_WRITE;
 }
 
 static int bio_get_length(bio_t *bio) {
@@ -976,22 +903,15 @@ static int bio_get_length(bio_t *bio) {
 }
 
 static void *bio_get_caller(bio_t *bio) {
-  struct bio_priv *bpriv = (struct bio_priv *)(bio->bi_private);
+  struct bio_priv *bpriv = bio->bi_private;
   return bpriv->priv;
 }
 
-/* FIX #9: bio->bi_bdev removed in kernel 5.12.
- * Retrieve the block_device via bio->bi_bdev on older kernels,
- * or via bio->bi_bdev (which bio_set_dev populates through bi_disk on
- * intermediate kernels).  generic_make_request() was renamed
- * submit_bio() in 5.9 — use the right call.
- */
+/* FIX #7c: always retrieve iodev from bpriv, never from bi_bdev. */
 static iodev_t *send_bio(bio_t *bio) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-  iodev_t *iodev = bio->bi_bdev;
-#else
-  iodev_t *iodev = bio->bi_bdev;
-#endif
+  struct bio_priv *bpriv = bio->bi_private;
+  iodev_t *iodev = bpriv->iodev;
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
   submit_bio(bio);
 #else
@@ -1000,7 +920,10 @@ static iodev_t *send_bio(bio_t *bio) {
   return iodev;
 }
 
-static iodev_t *bio_get_iodev(bio_t *bio) { return bio->bi_bdev; }
+static iodev_t *bio_get_iodev(bio_t *bio) {
+  struct bio_priv *bpriv = bio->bi_private;
+  return bpriv->iodev;
+}
 
 static uint64_t bio_get_start_sector(bio_t *bio) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
@@ -1019,28 +942,22 @@ static uint32_t bio_get_max_pages(iodev_t *iodev) {
 }
 
 static uint32_t bio_get_nr_sectors(bio_t *bio) { return bio_sectors(bio); }
-
 static void processor_yield(void) { yield(); }
 
 static int kproc_create(void *fn, void *data, kproc_t **task,
                         const char namefmt[], ...) {
   va_list args;
-  int ret;
   kproc_t *tsk;
   char name[64];
 
   va_start(args, namefmt);
   vsprintf(name, namefmt, args);
   va_end(args);
-
   tsk = kthread_run(fn, data, name);
-  if (IS_ERR(tsk)) {
-    ret = -1;
-  } else {
-    *task = tsk;
-    ret = 0;
-  }
-  return ret;
+  if (IS_ERR(tsk))
+    return -1;
+  *task = tsk;
+  return 0;
 }
 
 static int __copyout(void *kaddr, void *uaddr, size_t len) {
@@ -1057,7 +974,6 @@ static void kern_panic(char *msg) { panic(msg); }
 static void thread_start(struct tpriv *tpriv) {
   if (current->io_context)
     put_io_context(current->io_context);
-
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 3, 0))
   if (!(current->io_context = ioc_task_link(tpriv->data)))
     tpriv->data = get_io_context(GFP_KERNEL, -1);
@@ -1068,37 +984,82 @@ static void thread_start(struct tpriv *tpriv) {
   current->io_context = tpriv->data;
 #endif
 }
-
 static void thread_end(struct tpriv *tpriv) {}
+
 #else
 static void thread_start(struct tpriv *tpriv) {
   struct io_context *gioc = tpriv->data;
-
   get_io_context(GFP_KERNEL);
-
   if (!current->io_context)
     return;
-
   if (gioc)
     copy_io_context(&current->io_context, &gioc);
-  else {
+  else
     tpriv->data = current->io_context;
-  }
 }
 
 static void thread_end(struct tpriv *tpriv) {
   struct io_context *ioc = current->io_context;
-
   if (!ioc)
     return;
-
   task_lock(current);
   current->io_context = NULL;
   task_unlock(current);
-
   put_io_context(ioc);
 }
 #endif
+
+/*
+ * FIX #12 — struct qs_kern_cbs field-name / macro collision
+ * ----------------------------------------------------------
+ * linuxdefs.h defines convenience macros that are still active here:
+ *
+ *   #define free(ptr,type)        kfree(ptr)
+ *   #define malloc(s,type,flags)  kmalloc(s,flags)
+ *   #define zalloc(s,type,flags)  kzalloc(s,flags)
+ *   #define printf                printk
+ *   #define sprintf               (nothing — but snprintf clashes too)
+ *   #define ticks_to_msecs        jiffies_to_msecs
+ *   #define mtx_lock              spin_lock
+ *   #define mtx_unlock            spin_unlock
+ *   #define copyin(ua,ka,ln)      copy_from_user(ka,ua,ln)
+ *   #define copyout(ka,ua,ln)     copy_to_user(ua,ka,ln)
+ *   #define pause(s,m)            msleep(m)
+ *
+ * When the compiler sees the qs_kern_cbs struct literal below, the
+ * preprocessor rewrites every matching field name before the compiler
+ * ever sees the struct — e.g. ".mtx_lock = ..." becomes
+ * ".spin_lock = ..." which is not a member of the struct.
+ *
+ * Solution: push and undef every colliding macro for the duration of
+ * the struct literal, then pop to restore them.
+ * (#pragma push/pop_macro is supported by GCC >= 4.4.)
+ */
+#pragma push_macro("free")
+#pragma push_macro("malloc")
+#pragma push_macro("zalloc")
+#pragma push_macro("printf")
+#pragma push_macro("sprintf")
+#pragma push_macro("snprintf")
+#pragma push_macro("ticks_to_msecs")
+#pragma push_macro("mtx_lock")
+#pragma push_macro("mtx_unlock")
+#pragma push_macro("copyin")
+#pragma push_macro("copyout")
+#pragma push_macro("pause")
+
+#undef free
+#undef malloc
+#undef zalloc
+#undef printf
+#undef sprintf
+#undef snprintf
+#undef ticks_to_msecs
+#undef mtx_lock
+#undef mtx_unlock
+#undef copyin
+#undef copyout
+#undef pause
 
 static struct qs_kern_cbs kcbs = {
     .debug_warn = debug_warn,
@@ -1162,8 +1123,6 @@ static struct qs_kern_cbs kcbs = {
     .sched_prio = sched_prio,
     .get_cpu_count = get_cpu_count,
     .g_new_bio = g_new_bio,
-    /* FIX #8b: use renamed wrapper to avoid clash with kernel's bio_free_pages
-     */
     .bio_free_pages = qs_bio_free_pages,
     .bio_add_page = bio_add_page,
     .bio_free_page = bio_free_page,
@@ -1200,7 +1159,24 @@ static struct qs_kern_cbs kcbs = {
     .sock_nopush = sys_sock_nopush,
 };
 
-/* FIX #1 (definition): match the forward declaration above */
+/* Restore every macro suppressed for the struct initialiser above */
+#pragma pop_macro("pause")
+#pragma pop_macro("copyout")
+#pragma pop_macro("copyin")
+#pragma pop_macro("mtx_unlock")
+#pragma pop_macro("mtx_lock")
+#pragma pop_macro("ticks_to_msecs")
+#pragma pop_macro("snprintf")
+#pragma pop_macro("sprintf")
+#pragma pop_macro("printf")
+#pragma pop_macro("zalloc")
+#pragma pop_macro("malloc")
+#pragma pop_macro("free")
+
+/* ------------------------------------------------------------------ */
+/* Socket callbacks — defined after kcbs so they can reference it     */
+/* ------------------------------------------------------------------ */
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)
 static void sys_sock_data_ready(struct sock *sk)
 #else
@@ -1208,19 +1184,15 @@ static void sys_sock_data_ready(struct sock *sk, int count)
 #endif
 {
   sock_t *sys_sock = sk->sk_user_data;
-
   if (!sys_sock)
     return;
-
   (*kcbs.sock_read_avail)(sys_sock->priv);
 }
 
 static void sys_sock_write_space(struct sock *sk) {
   sock_t *sys_sock = sk->sk_user_data;
-
   if (!sys_sock)
     return;
-
   if (sk_stream_wspace(sk) >= sk_stream_min_wspace(sk))
     (*kcbs.sock_write_avail)(sys_sock->priv);
 }
@@ -1231,45 +1203,24 @@ static void sys_sock_state_change(struct sock *sk) {
 
   if (!sys_sock)
     return;
-
   switch (sk->sk_state) {
   case TCP_ESTABLISHED:
     newstate = SOCK_STATE_CONNECTED;
     break;
   default:
     newstate = SOCK_STATE_CLOSED;
+    break;
   }
   (*kcbs.sock_state_change)(sys_sock->priv, newstate);
 }
 
-sx_t ioctl_lock;
-static int coremod_open(vnode_t *i, struct file *f);
-static int coremod_release(vnode_t *i, struct file *f);
-static ssize_t coremod_read(struct file *file, char __user *buf, size_t count,
-                            loff_t *ppos);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
-static long coremod_ioctl(struct file *file, unsigned int cmd,
-                          unsigned long arg);
-#else
-static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
-                         unsigned long arg);
-#endif
+/* ------------------------------------------------------------------ */
+/* Character device / ioctl                                            */
+/* ------------------------------------------------------------------ */
 
-static struct file_operations coremod_fops = {
-    .owner = THIS_MODULE,
-    .open = coremod_open,
-    .release = coremod_release,
-    .read = coremod_read,
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
-    .compat_ioctl = coremod_ioctl,
-    .unlocked_ioctl = coremod_ioctl,
-#else
-    .ioctl = coremod_ioctl,
-#endif
-};
+sx_t ioctl_lock;
 
 static int coremod_open(vnode_t *i, struct file *f) { return 0; }
-
 static int coremod_release(vnode_t *i, struct file *f) { return 0; }
 
 static ssize_t coremod_read(struct file *file, char __user *buf, size_t count,
@@ -1295,14 +1246,10 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
   struct vcartridge *vcartridge;
   struct fc_rule_config fc_rule_config;
 
-  /* Check the capabilities of the user */
-  if (!capable(CAP_SYS_ADMIN)) {
-    return (-EPERM);
-  }
-
-  if (_IOC_TYPE(cmd) != TL_MAGIC) {
+  if (!capable(CAP_SYS_ADMIN))
+    return -EPERM;
+  if (_IOC_TYPE(cmd) != TL_MAGIC)
     return -ENOTTY;
-  }
 
   if (_IOC_DIR(cmd) & _IOC_READ) {
 #ifdef VERIFY_READ
@@ -1311,7 +1258,6 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
     err = !access_ok(userp, _IOC_SIZE(cmd));
 #endif
   }
-
   if (_IOC_DIR(cmd) & _IOC_WRITE) {
 #ifdef VERIFY_WRITE
     err = !access_ok(VERIFY_WRITE, userp, _IOC_SIZE(cmd));
@@ -1319,75 +1265,73 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
     err = !access_ok(userp, _IOC_SIZE(cmd));
 #endif
   }
-
-  if (err) {
+  if (err)
     return -EPERM;
-  }
 
-  sx_xlock(&ioctl_lock);
+  mutex_lock(&ioctl_lock);
   switch (cmd) {
   case TLTARGIOCDAEMONSETINFO:
-    if ((retval = copyin(userp, &mdaemon_info, sizeof(mdaemon_info))) != 0)
+    if ((retval = copy_from_user(&mdaemon_info, userp, sizeof(mdaemon_info))) !=
+        0)
       break;
     (*kcbs.mdaemon_set_info)(&mdaemon_info);
     break;
+
   case TLTARGIOCADDFCRULE:
   case TLTARGIOCREMOVEFCRULE:
-    if ((retval = copyin(userp, &fc_rule_config, sizeof(fc_rule_config))) != 0)
+    if ((retval = copy_from_user(&fc_rule_config, userp,
+                                 sizeof(fc_rule_config))) != 0)
       break;
     if (cmd == TLTARGIOCADDFCRULE)
       retval = (*kcbs.target_add_fc_rule)(&fc_rule_config);
-    else if (cmd == TLTARGIOCREMOVEFCRULE)
-      retval = (*kcbs.target_remove_fc_rule)(&fc_rule_config);
     else
-      retval = -1;
+      retval = (*kcbs.target_remove_fc_rule)(&fc_rule_config);
     break;
+
   case TLTARGIOCNEWBLKDEV:
   case TLTARGIOCDELBLKDEV:
   case TLTARGIOCGETBLKDEV:
   case TLTARGIOCUNMAPCONFIG:
-    bdev_info = malloc(sizeof(struct bdev_info), M_QUADSTOR, M_NOWAIT);
+    bdev_info = kmalloc(sizeof(*bdev_info), GFP_KERNEL);
     if (!bdev_info) {
       retval = -ENOMEM;
       break;
     }
-
-    if ((retval = copyin(userp, bdev_info, sizeof(struct bdev_info))) != 0) {
-      free(bdev_info, M_QUADSTOR);
+    if ((retval = copy_from_user(bdev_info, userp, sizeof(*bdev_info))) != 0) {
+      kfree(bdev_info);
       break;
     }
-
     if (cmd == TLTARGIOCNEWBLKDEV)
       retval = (*kcbs.bdev_add_new)(bdev_info);
     else if (cmd == TLTARGIOCDELBLKDEV)
       retval = (*kcbs.bdev_remove)(bdev_info);
     else if (cmd == TLTARGIOCGETBLKDEV)
       retval = (*kcbs.bdev_get_info)(bdev_info);
-    else if (cmd == TLTARGIOCUNMAPCONFIG)
+    else
       retval = (*kcbs.bdev_unmap_config)(bdev_info);
     if (retval == 0)
-      retval = copyout(bdev_info, userp, sizeof(struct bdev_info));
+      retval = copy_to_user(userp, bdev_info, sizeof(*bdev_info));
     else
-      err = copyout(bdev_info, userp, sizeof(struct bdev_info));
-    free(bdev_info, M_QUADSTOR);
+      err = copy_to_user(userp, bdev_info, sizeof(*bdev_info));
+    kfree(bdev_info);
     break;
+
   case TLTARGIOCNEWDEVICE:
   case TLTARGIOCDELETEDEVICE:
   case TLTARGIOCMODDEVICE:
   case TLTARGIOCGETDEVICEINFO:
   case TLTARGIOCLOADDRIVE:
   case TLTARGIOCRESETSTATS:
-    deviceinfo = malloc(sizeof(*deviceinfo), M_QUADSTOR, M_WAITOK);
+    deviceinfo = kmalloc(sizeof(*deviceinfo), GFP_KERNEL);
     if (!deviceinfo) {
       retval = -ENOMEM;
       break;
     }
-
-    if ((retval = copyin(userp, deviceinfo, sizeof(*deviceinfo))) != 0) {
-      free(deviceinfo, M_QUADSTOR);
+    if ((retval = copy_from_user(deviceinfo, userp, sizeof(*deviceinfo))) !=
+        0) {
+      kfree(deviceinfo);
       break;
     }
-
     if (cmd == TLTARGIOCNEWDEVICE)
       retval = (*kcbs.vdevice_new)(deviceinfo);
     else if (cmd == TLTARGIOCDELETEDEVICE)
@@ -1398,31 +1342,30 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       retval = (*kcbs.vdevice_info)(deviceinfo);
     else if (cmd == TLTARGIOCLOADDRIVE)
       retval = (*kcbs.vdevice_load)(deviceinfo);
-    else if (cmd == TLTARGIOCRESETSTATS)
-      retval = (*kcbs.vdevice_reset_stats)(deviceinfo);
-
-    if (retval == 0)
-      retval = copyout(deviceinfo, userp, sizeof(*deviceinfo));
     else
-      err = copyout(deviceinfo, userp, sizeof(*deviceinfo));
-    free(deviceinfo, M_QUADSTOR);
+      retval = (*kcbs.vdevice_reset_stats)(deviceinfo);
+    if (retval == 0)
+      retval = copy_to_user(userp, deviceinfo, sizeof(*deviceinfo));
+    else
+      err = copy_to_user(userp, deviceinfo, sizeof(*deviceinfo));
+    kfree(deviceinfo);
     break;
+
   case TLTARGIOCNEWVCARTRIDGE:
   case TLTARGIOCLOADVCARTRIDGE:
   case TLTARGIOCDELETEVCARTRIDGE:
   case TLTARGIOCGETVCARTRIDGEINFO:
   case TLTARGIOCRELOADEXPORT:
-    vcartridge = malloc(sizeof(*vcartridge), M_QUADSTOR, M_WAITOK);
+    vcartridge = kmalloc(sizeof(*vcartridge), GFP_KERNEL);
     if (!vcartridge) {
       retval = -ENOMEM;
       break;
     }
-
-    if ((retval = copyin(userp, vcartridge, sizeof(*vcartridge))) != 0) {
-      free(vcartridge, M_QUADSTOR);
+    if ((retval = copy_from_user(vcartridge, userp, sizeof(*vcartridge))) !=
+        0) {
+      kfree(vcartridge);
       break;
     }
-
     if (cmd == TLTARGIOCNEWVCARTRIDGE)
       retval = (*kcbs.vcartridge_new)(vcartridge);
     else if (cmd == TLTARGIOCLOADVCARTRIDGE)
@@ -1431,14 +1374,15 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
       retval = (*kcbs.vcartridge_delete)(vcartridge);
     else if (cmd == TLTARGIOCGETVCARTRIDGEINFO)
       retval = (*kcbs.vcartridge_info)(vcartridge);
-    else if (cmd == TLTARGIOCRELOADEXPORT)
+    else
       retval = (*kcbs.vcartridge_reload)(vcartridge);
     if (retval == 0)
-      retval = copyout(vcartridge, userp, sizeof(*vcartridge));
+      retval = copy_to_user(userp, vcartridge, sizeof(*vcartridge));
     else
-      err = copyout(vcartridge, userp, sizeof(*vcartridge));
-    free(vcartridge, M_QUADSTOR);
+      err = copy_to_user(userp, vcartridge, sizeof(*vcartridge));
+    kfree(vcartridge);
     break;
+
   case TLTARGIOCCHECKDISKS:
     retval = (*kcbs.coremod_check_disks)();
     break;
@@ -1451,92 +1395,109 @@ static int coremod_ioctl(vnode_t *i, struct file *f, uint32_t cmd,
   case TLTARGIOCUNLOAD:
     retval = (*kcbs.coremod_exit)();
     break;
+
   case TLTARGIOCADDGROUP:
   case TLTARGIOCDELETEGROUP:
   case TLTARGIOCRENAMEGROUP:
-    group_conf = malloc(sizeof(*group_conf), M_QUADSTOR, M_WAITOK);
+    group_conf = kmalloc(sizeof(*group_conf), GFP_KERNEL);
     if (!group_conf) {
       retval = -ENOMEM;
       break;
     }
-
-    if ((retval = copyin(userp, group_conf, sizeof(*group_conf))) != 0) {
-      free(group_conf, M_QUADSTOR);
+    if ((retval = copy_from_user(group_conf, userp, sizeof(*group_conf))) !=
+        0) {
+      kfree(group_conf);
       break;
     }
-
     if (cmd == TLTARGIOCADDGROUP)
       retval = (*kcbs.bdev_add_group)(group_conf);
     else if (cmd == TLTARGIOCDELETEGROUP)
       retval = (*kcbs.bdev_delete_group)(group_conf);
-    else if (cmd == TLTARGIOCRENAMEGROUP)
+    else
       retval = (*kcbs.bdev_rename_group)(group_conf);
-    free(group_conf, M_QUADSTOR);
+    kfree(group_conf);
     break;
+
   default:
     break;
   }
-  sx_xunlock(&ioctl_lock);
-
+  mutex_unlock(&ioctl_lock);
   return retval;
 }
 
+static struct file_operations coremod_fops = {
+    .owner = THIS_MODULE,
+    .open = coremod_open,
+    .release = coremod_release,
+    .read = coremod_read,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
+    .compat_ioctl = coremod_ioctl,
+    .unlocked_ioctl = coremod_ioctl,
+#else
+    .ioctl = coremod_ioctl,
+#endif
+};
+
+/* ------------------------------------------------------------------ */
+/* Cache init / exit                                                   */
+/* ------------------------------------------------------------------ */
+
 static void exit_caches(void) {
   if (bpriv_cache)
-    uma_zdestroy("vt_bpriv_cache", bpriv_cache);
-
+    kmem_cache_destroy(bpriv_cache);
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
   if (tpriv_cache)
-    uma_zdestroy("vt_tpriv_cache", tpriv_cache);
+    kmem_cache_destroy(tpriv_cache);
 #endif
-
   if (mtx_cache)
-    uma_zdestroy("vt_mtx_cache", mtx_cache);
-
+    kmem_cache_destroy(mtx_cache);
   if (sx_cache)
-    uma_zdestroy("vt_sx_cache", sx_cache);
-
+    kmem_cache_destroy(sx_cache);
   if (cv_cache)
-    uma_zdestroy("vt_cv_cache", cv_cache);
+    kmem_cache_destroy(cv_cache);
 }
 
 static int init_caches(void) {
   int mtx_size;
 
-  bpriv_cache = uma_zcreate("vt_bpriv_cache", sizeof(struct bio_priv));
+  bpriv_cache =
+      kmem_cache_create("vt_bpriv_cache", sizeof(struct bio_priv), 0, 0, NULL);
   if (unlikely(!bpriv_cache))
     return -1;
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
-  tpriv_cache = uma_zcreate("vt_tpriv_cache", sizeof(struct blk_plug));
+  tpriv_cache =
+      kmem_cache_create("vt_tpriv_cache", sizeof(struct blk_plug), 0, 0, NULL);
   if (unlikely(!tpriv_cache))
     return -1;
 #endif
 
   mtx_size = max_t(int, sizeof(mtx_t), sizeof(void *));
-
-  mtx_cache = uma_zcreate("vt_mtx_cache", mtx_size);
+  mtx_cache = kmem_cache_create("vt_mtx_cache", mtx_size, 0, 0, NULL);
   if (unlikely(!mtx_cache))
     return -1;
 
-  sx_cache = uma_zcreate("vt_sx_cache", sizeof(sx_t));
+  sx_cache = kmem_cache_create("vt_sx_cache", sizeof(sx_t), 0, 0, NULL);
   if (unlikely(!sx_cache))
     return -1;
 
-  cv_cache = uma_zcreate("vt_cv_cache", sizeof(cv_t));
+  cv_cache = kmem_cache_create("vt_cv_cache", sizeof(cv_t), 0, 0, NULL);
   if (unlikely(!cv_cache))
     return -1;
+
   return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Module interface registration                                       */
+/* ------------------------------------------------------------------ */
+
 #define coremod THIS_MODULE
+
 int vtdevice_register_interface(struct qs_interface_cbs *icbs) {
   int retval;
-
-  if (!module_reference(coremod)) {
+  if (!module_reference(coremod))
     return -1;
-  }
-
   retval = __device_register_interface(icbs);
   if (retval != 0)
     module_release(coremod);
@@ -1545,18 +1506,21 @@ int vtdevice_register_interface(struct qs_interface_cbs *icbs) {
 
 void vtdevice_unregister_interface(struct qs_interface_cbs *icbs) {
   int retval;
-
   retval = __device_unregister_interface(icbs);
   if (retval == 0)
     module_release(coremod);
 }
+
+/* ------------------------------------------------------------------ */
+/* Module init / exit                                                  */
+/* ------------------------------------------------------------------ */
 
 static int dev_major;
 
 static int coremod_init(void) {
   int retval;
 
-  sx_init(&ioctl_lock, "core ioctl lck");
+  mutex_init(&ioctl_lock);
 
   retval = init_caches();
   if (unlikely(retval != 0)) {
@@ -1576,14 +1540,13 @@ static int coremod_init(void) {
     exit_caches();
     return dev_major;
   }
-
   return 0;
 }
 
 static void coremod_exit(void) {
-  sx_xlock(&ioctl_lock);
+  mutex_lock(&ioctl_lock);
   vtkern_interface_exit();
-  sx_xunlock(&ioctl_lock);
+  mutex_unlock(&ioctl_lock);
   exit_caches();
   unregister_chrdev(dev_major, TL_DEV_NAME);
 }
